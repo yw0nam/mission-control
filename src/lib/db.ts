@@ -280,7 +280,7 @@ export interface Tenant {
   display_name: string
   linux_user: string
   plan_tier: string
-  status: 'pending' | 'provisioning' | 'active' | 'suspended' | 'error'
+  status: 'pending' | 'provisioning' | 'decommissioning' | 'active' | 'suspended' | 'error'
   openclaw_home: string
   workspace_root: string
   gateway_port?: number
@@ -288,6 +288,7 @@ export interface Tenant {
   config?: string
   created_by: string
   owner_gateway?: string
+  owner_user_id?: number | null
   created_at: number
   updated_at: number
 }
@@ -304,7 +305,7 @@ export interface Workspace {
 export interface ProvisionJob {
   id: number
   tenant_id: number
-  job_type: 'bootstrap' | 'update' | 'decommission'
+  job_type: 'bootstrap' | 'update' | 'decommission' | 'suspend' | 'resume'
   status: 'queued' | 'approved' | 'running' | 'completed' | 'failed' | 'rejected' | 'cancelled'
   dry_run: 0 | 1
   requested_by: string
