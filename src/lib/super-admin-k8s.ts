@@ -18,7 +18,10 @@
 import fs from 'fs'
 import path from 'path'
 import { config as appConfig } from './config'
+import { runCommand } from './command'
+import { isValidSlug } from './super-admin'
 import type { ProvisionStep } from './super-admin'
+import type { Tenant } from './db'
 
 const KUBECTL = process.env.MC_KUBECTL_PATH || '/usr/bin/kubectl'
 
@@ -37,6 +40,12 @@ function artifactDir(slug: string): string {
 }
 
 // --- Manifests (verbatim from poc/*.yaml, placeholders __NS__ / __NAME__ / __OPENAI_BASE_URL__) ---
+
+const NAMESPACE_TEMPLATE = `apiVersion: v1
+kind: Namespace
+metadata:
+  name: __NS__
+`
 
 const INSTANCE_TEMPLATE = `apiVersion: v1
 kind: Secret
@@ -132,8 +141,10 @@ function render(template: string, slug: string): string {
 /** Renders the three tenant manifests to disk before a bootstrap job runs. */
 export function ensureK8sArtifacts(slug: string): { dir: string } {
   if (!slug) throw new Error('Missing tenant slug for k8s artifact generation')
+  if (!isValidSlug(slug)) throw new Error(`Invalid tenant slug for k8s artifact generation: ${slug}`)
   const dir = artifactDir(slug)
   fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'namespace.yaml'), render(NAMESPACE_TEMPLATE, slug), { mode: 0o600 })
   fs.writeFileSync(path.join(dir, 'instance.yaml'), render(INSTANCE_TEMPLATE, slug), { mode: 0o600 })
   fs.writeFileSync(path.join(dir, 'egress-lockdown.yaml'), render(EGRESS_TEMPLATE, slug), { mode: 0o600 })
   fs.writeFileSync(path.join(dir, 'tenant-quota.yaml'), render(QUOTA_TEMPLATE, slug), { mode: 0o600 })
@@ -149,7 +160,7 @@ export function buildK8sBootstrapPlan(slug: string): ProvisionStep[] {
     {
       key: 'create-namespace',
       title: `Create namespace ${ns}`,
-      command: [KUBECTL, 'create', 'namespace', ns],
+      command: [KUBECTL, 'apply', '-f', path.join(dir, 'namespace.yaml')],
       requires_root: false,
       timeout_ms: 15000,
     },
@@ -208,6 +219,66 @@ export function buildK8sResumePlan(slug: string): ProvisionStep[] {
       timeout_ms: 30000,
     },
   ]
+}
+
+// --- Status projection (read live phase from the operator) ---
+
+// Short-lived cache so a burst of GET /api/me/instance reads can't fan out into a
+// kubectl spawn per request (DoS mitigation). Caches both success and null results.
+const PHASE_TTL_MS = 15000
+const phaseCache = new Map<string, { phase: string | null; ts: number }>()
+
+/**
+ * Reads `.status.phase` of the tenant's OpenClawInstance straight from the cluster.
+ * Returns the trimmed phase string, or null on ANY error (invalid slug, kubectl
+ * missing, cluster unreachable, instance absent, empty status). MC must never crash
+ * on read. Results are cached for PHASE_TTL_MS to bound kubectl spawns.
+ */
+export async function readInstancePhase(slug: string): Promise<string | null> {
+  if (!slug || !isValidSlug(slug)) return null
+  const cached = phaseCache.get(slug)
+  if (cached && Date.now() - cached.ts < PHASE_TTL_MS) return cached.phase
+  const ns = k8sNamespace(slug)
+  let phase: string | null = null
+  try {
+    const result = await runCommand(
+      KUBECTL,
+      ['get', 'openclawinstance', slug, '-n', ns, '-o', 'jsonpath={.status.phase}'],
+      { timeoutMs: 15000 },
+    )
+    const trimmed = (result.stdout || '').trim()
+    phase = trimmed.length > 0 ? trimmed : null
+  } catch {
+    phase = null
+  }
+  phaseCache.set(slug, { phase, ts: Date.now() })
+  return phase
+}
+
+/**
+ * Maps an operator `.status.phase` to an MC tenant status string. Pure + unit-testable.
+ * Unknown/empty phases return null so the caller keeps the existing DB value.
+ * Note: operator phases like BackingUp/Restoring/Updating intentionally return null --
+ * they have no corresponding MC Tenant.status enum member, so the caller keeps the
+ * current status rather than projecting a value that doesn't exist.
+ */
+export function mapPhaseToStatus(phase: string | null | undefined): Tenant['status'] | null {
+  switch (String(phase || '').trim()) {
+    case 'Running':
+      return 'active'
+    case 'Suspended':
+      return 'suspended'
+    case 'Pending':
+    case 'Provisioning':
+      return 'provisioning'
+    case 'Failed':
+    case 'Degraded':
+      return 'error'
+    case 'Terminating':
+      return 'decommissioning'
+    default:
+      return null
+  }
 }
 
 /** Full teardown: delete the tenant namespace (cascades all child objects). */

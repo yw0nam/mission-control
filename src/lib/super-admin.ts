@@ -64,7 +64,7 @@ function normalizeSlug(input: string): string {
   return (input || '').trim().toLowerCase()
 }
 
-function isValidSlug(slug: string): boolean {
+export function isValidSlug(slug: string): boolean {
   return /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/.test(slug)
 }
 
@@ -378,6 +378,43 @@ export function getTenantForOwner(userId: number): Tenant | null {
   `).get(userId) as Tenant | undefined
   if (!row) return null
   return { ...row, config: parseJsonField(row.config, {}) as any }
+}
+
+/**
+ * Persists a new lifecycle status on a tenant. Used by status projection so a read
+ * path can reconcile the DB with the live operator phase. Mirrors the inline UPDATE
+ * used by executeProvisionJob.
+ */
+export function updateTenantStatus(
+  tenantId: number,
+  status: Tenant['status'],
+  expected?: Tenant['status'],
+): void {
+  const db = getDatabase()
+  // When `expected` is supplied the UPDATE is conditional on the current value,
+  // closing the lost-update window between the projection read and this write.
+  const result = expected !== undefined
+    ? db.prepare(`
+        UPDATE tenants
+        SET status = ?, updated_at = (unixepoch())
+        WHERE id = ? AND status = ?
+      `).run(status, tenantId, expected)
+    : db.prepare(`
+        UPDATE tenants
+        SET status = ?, updated_at = (unixepoch())
+        WHERE id = ?
+      `).run(status, tenantId)
+
+  // Only audit a real transition (conditional UPDATE may have matched no row).
+  if (result.changes > 0) {
+    logAuditEvent({
+      action: 'tenant_status_projected',
+      actor: 'system:projection',
+      target_type: 'tenant',
+      target_id: tenantId,
+      detail: { from: expected ?? null, to: status },
+    })
+  }
 }
 
 /**
