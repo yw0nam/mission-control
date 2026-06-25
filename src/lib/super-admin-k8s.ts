@@ -256,6 +256,27 @@ export async function readInstancePhase(slug: string): Promise<string | null> {
 }
 
 /**
+ * Reports user activity to the cluster by stamping `openclaw.rocks/last-active`
+ * (unix seconds) on the tenant's OpenClawInstance. The operator owns the idle
+ * decision (it suspends when this is older than its idle window); MC only reports
+ * the fact. Best-effort: never throws — a failed stamp must not break brokering.
+ */
+export async function stampLastActive(slug: string): Promise<void> {
+  if (!slug || !isValidSlug(slug)) return
+  const ns = k8sNamespace(slug)
+  const now = Math.floor(Date.now() / 1000)
+  try {
+    await runCommand(
+      KUBECTL,
+      ['annotate', 'openclawinstance', slug, '-n', ns, `openclaw.rocks/last-active=${now}`, '--overwrite'],
+      { timeoutMs: 15000 },
+    )
+  } catch {
+    // best-effort
+  }
+}
+
+/**
  * Reads the tenant gateway address from `.status.gatewayEndpoint` (e.g.
  * `<name>.user-<slug>.svc:18789`). ClusterIP — only reachable in-cluster (or via
  * a port-forward). Returns null on any error. Name is read from CR status, never

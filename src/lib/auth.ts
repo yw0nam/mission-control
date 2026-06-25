@@ -626,6 +626,33 @@ function deriveRoleFromScopes(scopes: Set<string>): User['role'] {
 const ROLE_LEVELS: Record<string, number> = { viewer: 0, operator: 1, admin: 2 }
 
 /**
+ * Tenant isolation allowlist (spec #2). A 'viewer' here is an OpenClaw pod OWNER:
+ * confined to their own instance, never host or other-tenant data. Every route below
+ * is owner-scoped or shell-render-only; everything else (host/operator data surface)
+ * is denied even though the route nominally accepts a 'viewer'. Admin/operator are
+ * NOT subject to this — they are server-side staff.
+ */
+const TENANT_USER_ALLOWED_PREFIXES = ['/api/me/']
+const TENANT_USER_ALLOWED_EXACT = new Set([
+  '/api/auth/me',
+  '/api/auth/logout',
+  '/ws/gateway', // MC → own-pod broker (gateway resolved server-side, token never exposed)
+  '/api/onboarding', // SPA shell render only (non-sensitive)
+  '/api/status', // SPA shell render only (capabilities/health)
+])
+
+function isTenantUserAllowedPath(request: Request): boolean {
+  let pathname: string
+  try {
+    pathname = new URL(request.url).pathname
+  } catch {
+    return false // unparseable URL → deny (default-deny)
+  }
+  if (TENANT_USER_ALLOWED_EXACT.has(pathname)) return true
+  return TENANT_USER_ALLOWED_PREFIXES.some((p) => pathname.startsWith(p))
+}
+
+/**
  * Check if a user meets the minimum role requirement.
  * Returns { user } on success, or { error, status } on failure (401 or 403).
  */
@@ -636,6 +663,12 @@ export function requireRole(
   const user = getUserFromRequest(request)
   if (!user) {
     return { error: 'Authentication required', status: 401 }
+  }
+  // Tenant isolation (spec #2): a pod owner ('viewer') may ONLY reach owner-scoped
+  // routes. All host/operator data routes are denied here — this is the single
+  // default-deny choke point that confines a tenant to their own instance.
+  if (user.role === 'viewer' && !isTenantUserAllowedPath(request)) {
+    return { error: 'Tenant users may only access their own instance', status: 403 }
   }
   if ((ROLE_LEVELS[user.role] ?? -1) < ROLE_LEVELS[minRole]) {
     return { error: `Requires ${minRole} role or higher`, status: 403 }

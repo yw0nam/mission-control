@@ -1441,8 +1441,9 @@ const migrations: Migration[] = [
   {
     id: '052_tenant_activity',
     up(db: Database.Database) {
-      // Last time MC brokered a gateway connection for this tenant. Drives the
-      // idle auto-suspend sweeper (suspend when now - last_active_at > idle window).
+      // Last time MC brokered a gateway connection for this tenant. Informational,
+      // surfaced in the owner-facing /api/me/usage view. (Idle auto-suspend is owned
+      // by the operator, which reads the openclaw.rocks/last-active CR annotation.)
       db.exec(`ALTER TABLE tenants ADD COLUMN last_active_at INTEGER DEFAULT NULL`)
     }
   }

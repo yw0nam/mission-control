@@ -11,6 +11,25 @@ interface Instance {
   plan_tier: string
 }
 
+interface ActivityEvent {
+  kind: string
+  status: string
+  requested_by: string | null
+  created_at: number
+  completed_at: number | null
+}
+
+interface Usage {
+  instance: { created_at: number; last_active_at: number | null }
+  activity: ActivityEvent[]
+  note: string
+}
+
+function fmtTime(epoch: number | null | undefined): string {
+  if (!epoch) return '—'
+  return new Date(epoch * 1000).toLocaleString()
+}
+
 type ConnState = 'idle' | 'connecting' | 'connected' | 'streaming' | 'closed' | 'error'
 
 const STATUS_STYLE: Record<string, string> = {
@@ -30,6 +49,7 @@ const STATUS_STYLE: Record<string, string> = {
  */
 export function MyInstancePanel() {
   const [instance, setInstance] = useState<Instance | null>(null)
+  const [usage, setUsage] = useState<Usage | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -42,6 +62,7 @@ export function MyInstancePanel() {
     try {
       const data = await apiFetch<{ instance: Instance }>('/api/me/instance')
       setInstance(data.instance)
+      try { setUsage(await apiFetch<Usage>('/api/me/usage')) } catch { setUsage(null) }
     } catch (e) {
       setInstance(null)
       setError(e instanceof Error ? e.message : 'No instance assigned')
@@ -141,6 +162,42 @@ export function MyInstancePanel() {
             <span className="text-muted-foreground"> (waking your instance, ~8s…)</span>
           )}
         </div>
+      </div>
+
+      <div className="rounded-lg border border-border bg-card p-6">
+        <h3 className="text-sm font-semibold text-primary">My usage</h3>
+        {usage ? (
+          <>
+            <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
+              <div>
+                <span className="text-xs text-muted-foreground">member since</span>
+                <div>{fmtTime(usage.instance.created_at)}</div>
+              </div>
+              <div>
+                <span className="text-xs text-muted-foreground">last active</span>
+                <div>{fmtTime(usage.instance.last_active_at)}</div>
+              </div>
+            </div>
+            <div className="mt-4">
+              <span className="text-xs text-muted-foreground">activity</span>
+              {usage.activity.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No lifecycle activity yet. Suspend/resume your instance to see history here.</p>
+              ) : (
+                <ul className="mt-1 space-y-1 text-sm">
+                  {usage.activity.map((a, i) => (
+                    <li key={i} className="flex justify-between">
+                      <span className="font-mono">{a.kind} · {a.status}</span>
+                      <span className="text-muted-foreground">{fmtTime(a.created_at)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <p className="mt-3 text-xs text-muted-foreground">{usage.note}</p>
+          </>
+        ) : (
+          <p className="mt-1 text-sm text-muted-foreground">Usage data unavailable.</p>
+        )}
       </div>
     </div>
   )

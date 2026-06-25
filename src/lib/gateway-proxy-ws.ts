@@ -20,14 +20,28 @@ import { config } from './config'
 import { getDetectedGatewayToken } from './gateway-runtime'
 import { resolveTenantGateway } from './tenant-gateway'
 import { runSelfServiceLifecycle, markTenantActive } from './super-admin'
-import { readInstancePhase, k8sNamespace } from './super-admin-k8s'
+import { readInstancePhase, k8sNamespace, stampLastActive } from './super-admin-k8s'
 
 const log = logger.child({ module: 'gateway-proxy-ws' })
 const KUBECTL = process.env.MC_KUBECTL_PATH || '/usr/bin/kubectl'
 
+// Activity-report throttle (spec: B1). Each brokered browser->pod frame is real
+// user interaction, but we only re-stamp the CR annotation at most once per
+// window per slug so kubectl spawns stay bounded. In-memory is fine: a single MC
+// process owns the broker, and a stale entry only costs one extra stamp.
+const STAMP_THROTTLE_MS = 60_000
+const lastStampAt = new Map<string, number>()
+function reportActivity(slug: string): void {
+  const now = Date.now()
+  if (now - (lastStampAt.get(slug) ?? 0) < STAMP_THROTTLE_MS) return
+  lastStampAt.set(slug, now)
+  void stampLastActive(slug)
+}
+
 interface ProxyContext {
   upstreamUrl: string
   pfProc: ChildProcess | null
+  slug?: string // tenant slug, present for owner (non-admin) sessions — drives activity reporting
 }
 
 let wss: WebSocketServer | null = null
@@ -104,6 +118,10 @@ function initServer(): WebSocketServer {
     upstream.on('error', (err) => { log.warn({ err: err?.message }, 'upstream gateway error'); try { browserWs.close() } catch {} ; cleanup() })
 
     browserWs.on('message', (data: Buffer, isBinary: boolean) => {
+      // A browser->pod frame is user interaction (UI click/command): report activity
+      // to the cluster (throttled) so the operator's idle-suspend stays off while the
+      // owner is actively working.
+      if (ctx.slug) reportActivity(ctx.slug)
       if (upstreamOpen) { try { upstream.send(data, { binary: isBinary }) } catch {} }
       else queue.push({ data, binary: isBinary })
     })
@@ -128,6 +146,7 @@ export async function handleGatewayUpgrade(req: IncomingMessage, socket: any, he
 
   let upstreamUrl: string
   let pfProc: ChildProcess | null = null
+  let slug: string | undefined
 
   try {
     const res = await resolveTenantGateway({ id: user.id, role: user.role })
@@ -157,6 +176,9 @@ export async function handleGatewayUpgrade(req: IncomingMessage, socket: any, he
       pfProc = pf.proc
       upstreamUrl = `ws://127.0.0.1:${pf.localPort}/?token=${encodeURIComponent(res.token)}`
       markTenantActive(res.tenant.id)
+      slug = res.tenant.slug
+      // Report activity to the cluster on connect (operator reads it to decide idle).
+      reportActivity(slug)
     }
   } catch (err) {
     log.error({ err: (err as Error)?.message }, 'gateway upgrade failed')
@@ -165,7 +187,7 @@ export async function handleGatewayUpgrade(req: IncomingMessage, socket: any, he
   }
 
   if (!wss) initServer()
-  ;(req as any).__gwctx = { upstreamUrl, pfProc } as ProxyContext
+  ;(req as any).__gwctx = { upstreamUrl, pfProc, slug } as ProxyContext
   wss!.handleUpgrade(req, socket, head, (ws) => {
     wss!.emit('connection', ws, req)
   })
