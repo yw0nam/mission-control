@@ -40,8 +40,9 @@ const server = http.createServer((req, res) => {
   // which calls server.listen() internally — we intercept before that
 })
 
-// PTY WebSocket upgrade handler (lazy-loaded to avoid native addon issues at import time)
+// WebSocket upgrade handlers (lazy-loaded to avoid native addon issues at import time)
 let handlePtyUpgrade = null
+let handleGatewayUpgrade = null
 
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
@@ -66,6 +67,28 @@ server.on('upgrade', (req, socket, head) => {
     return
   }
 
+  if (url.pathname === '/ws/gateway') {
+    // Lazy-load the tenant gateway broker (server-side reverse-proxy)
+    if (!handleGatewayUpgrade) {
+      try {
+        handleGatewayUpgrade = require('../src/lib/gateway-proxy-ws').handleGatewayUpgrade
+      } catch (err) {
+        console.error('[mc-server] Failed to load gateway proxy handler:', err.message)
+        socket.destroy()
+        return
+      }
+    }
+
+    // handleGatewayUpgrade is async (resolve tenant + auto-wake + port-forward)
+    Promise.resolve(handleGatewayUpgrade(req, socket, head))
+      .then((handled) => { if (!handled) socket.destroy() })
+      .catch((err) => {
+        console.error('[mc-server] Gateway upgrade error:', err && err.message)
+        try { socket.destroy() } catch {}
+      })
+    return
+  }
+
   // Let Next.js handle other WebSocket upgrades (e.g., HMR in dev)
   // In standalone mode, Next.js doesn't use WebSocket, so just close
   socket.destroy()
@@ -86,6 +109,25 @@ function shutdown() {
 
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
+
+// Idle auto-suspend sweeper (k8s broker PoC). Disabled unless MC_IDLE_SUSPEND_SECONDS
+// is set (>0). Demo: MC_IDLE_SUSPEND_SECONDS=90 makes auto-suspend visible.
+const IDLE_SECONDS = parseInt(process.env.MC_IDLE_SUSPEND_SECONDS || '0', 10)
+if (IDLE_SECONDS > 0) {
+  setInterval(() => {
+    let sweepIdleTenants
+    try {
+      sweepIdleTenants = require('../src/lib/super-admin').sweepIdleTenants
+    } catch (err) {
+      console.error('[mc-server] Failed to load idle sweeper:', err.message)
+      return
+    }
+    Promise.resolve(sweepIdleTenants(IDLE_SECONDS))
+      .then((n) => { if (n) console.log(`[mc-server] idle auto-suspend: suspended ${n} tenant(s)`) })
+      .catch((err) => console.error('[mc-server] idle-suspend error:', err && err.message))
+  }, 60000).unref()
+  console.log(`[mc-server] idle auto-suspend: every 60s, window ${IDLE_SECONDS}s`)
+}
 
 console.log(`[mc-server] Mission Control starting on ${HOST}:${PORT}`)
 console.log('[mc-server] PTY terminal support: enabled')

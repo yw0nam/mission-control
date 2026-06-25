@@ -417,6 +417,45 @@ export function updateTenantStatus(
   }
 }
 
+/** Stamp the last time MC brokered a gateway connection for this tenant (idle clock). */
+export function markTenantActive(tenantId: number): void {
+  const db = getDatabase()
+  db.prepare(`UPDATE tenants SET last_active_at = (unixepoch()) WHERE id = ?`).run(tenantId)
+}
+
+/**
+ * Idle auto-suspend sweep: suspend every active tenant whose last brokered gateway
+ * connection is older than `idleSeconds`. Tenants never connected (last_active_at
+ * NULL) are left alone. Returns the count suspended.
+ *
+ * ponytail: idle = "no brokered request recently". A pod running a long background
+ * workflow with no live browser would still be suspended — upgrade path is an
+ * operator-side in-flight-job guard (deferred for the PoC).
+ */
+export async function sweepIdleTenants(idleSeconds: number): Promise<number> {
+  const db = getDatabase()
+  const cutoff = Math.floor(Date.now() / 1000) - Math.max(1, idleSeconds)
+  const rows = db.prepare(`
+    SELECT id, slug FROM tenants
+    WHERE status = 'active' AND last_active_at IS NOT NULL AND last_active_at < ?
+  `).all(cutoff) as Array<{ id: number; slug: string }>
+
+  let suspended = 0
+  for (const t of rows) {
+    const actor = 'system:idle-sweeper'
+    try {
+      const { job } = createTenantLifecycleJob(t.id, 'suspend', { dry_run: false }, actor)
+      if (!job) continue
+      transitionProvisionJobStatus(job.id, actor, 'approve')
+      await executeProvisionJob(job.id, actor)
+      suspended++
+    } catch {
+      // never let one tenant's failure stop the sweep
+    }
+  }
+  return suspended
+}
+
 /**
  * Owner self-service suspend/resume. EXEMPT from the two-person rule (reversible,
  * low-risk): the owner both requests, approves, and runs the live job.

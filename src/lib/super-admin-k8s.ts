@@ -256,6 +256,72 @@ export async function readInstancePhase(slug: string): Promise<string | null> {
 }
 
 /**
+ * Reads the tenant gateway address from `.status.gatewayEndpoint` (e.g.
+ * `<name>.user-<slug>.svc:18789`). ClusterIP — only reachable in-cluster (or via
+ * a port-forward). Returns null on any error. Name is read from CR status, never
+ * hardcoded, so a future operator rename does not break the broker.
+ */
+export async function readGatewayEndpoint(
+  slug: string,
+): Promise<{ host: string; port: number } | null> {
+  if (!slug || !isValidSlug(slug)) return null
+  const ns = k8sNamespace(slug)
+  try {
+    const result = await runCommand(
+      KUBECTL,
+      ['get', 'openclawinstance', slug, '-n', ns, '-o', 'jsonpath={.status.gatewayEndpoint}'],
+      { timeoutMs: 15000 },
+    )
+    const endpoint = (result.stdout || '').trim()
+    if (!endpoint) return null
+    const [host, portStr] = endpoint.split(':')
+    if (!host) return null
+    const port = Number(portStr) || 18789
+    return { host, port }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Reads the tenant gateway token: resolves the Secret name from
+ * `.status.managedResources.gatewayTokenSecret`, then reads its `token` key and
+ * base64-decodes it. Returns null on any error. The token stays server-side — it
+ * is attached by the WS proxy and never sent to the browser.
+ */
+export async function readGatewayToken(slug: string): Promise<string | null> {
+  if (!slug || !isValidSlug(slug)) return null
+  const ns = k8sNamespace(slug)
+  try {
+    const nameRes = await runCommand(
+      KUBECTL,
+      [
+        'get',
+        'openclawinstance',
+        slug,
+        '-n',
+        ns,
+        '-o',
+        'jsonpath={.status.managedResources.gatewayTokenSecret}',
+      ],
+      { timeoutMs: 15000 },
+    )
+    const secretName = (nameRes.stdout || '').trim()
+    if (!secretName) return null
+    const tokenRes = await runCommand(
+      KUBECTL,
+      ['get', 'secret', secretName, '-n', ns, '-o', 'jsonpath={.data.token}'],
+      { timeoutMs: 15000 },
+    )
+    const b64 = (tokenRes.stdout || '').trim()
+    if (!b64) return null
+    return Buffer.from(b64, 'base64').toString('utf8').trim() || null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Maps an operator `.status.phase` to an MC tenant status string. Pure + unit-testable.
  * Unknown/empty phases return null so the caller keeps the existing DB value.
  * Note: operator phases like BackingUp/Restoring/Updating intentionally return null --

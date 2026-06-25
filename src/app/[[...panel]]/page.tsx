@@ -12,6 +12,7 @@ import { MemoryBrowserPanel } from '@/components/panels/memory-browser-panel'
 import { CostTrackerPanel } from '@/components/panels/cost-tracker-panel'
 import { TaskBoardPanel } from '@/components/panels/task-board-panel'
 import { ActivityFeedPanel } from '@/components/panels/activity-feed-panel'
+import { MyInstancePanel } from '@/components/panels/my-instance-panel'
 import { AgentSquadPanelPhase3 } from '@/components/panels/agent-squad-panel-phase3'
 import { AgentCommsPanel } from '@/components/panels/agent-comms-panel'
 import { StandupPanel } from '@/components/panels/standup-panel'
@@ -522,10 +523,16 @@ const ESSENTIAL_PANELS = new Set([
 
 function ContentRouter({ tab }: { tab: string }) {
   const tp = useTranslations('page')
-  const { dashboardMode, interfaceMode, setInterfaceMode } = useMissionControl()
+  const { dashboardMode, interfaceMode, setInterfaceMode, currentUser } = useMissionControl()
   const navigateToPanel = useNavigateToPanel()
   const isLocal = dashboardMode === 'local'
   const panelName = tab.replace(/-/g, ' ')
+
+  // PoC owner isolation: a non-admin (owner) only ever renders their own instance,
+  // regardless of the URL — they cannot reach operator/host panels through the UI.
+  if (currentUser && currentUser.role !== 'admin' && tab !== 'my-instance') {
+    return <MyInstancePanel />
+  }
 
   // Guard: show nudge for non-essential panels in essential mode
   if (interfaceMode === 'essential' && !ESSENTIAL_PANELS.has(tab)) {
@@ -558,6 +565,8 @@ function ContentRouter({ tab }: { tab: string }) {
   }
 
   switch (tab) {
+    case 'my-instance':
+      return <MyInstancePanel />
     case 'overview':
       return (
         <>

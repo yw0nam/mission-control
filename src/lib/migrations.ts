@@ -1437,6 +1437,14 @@ const migrations: Migration[] = [
       db.exec(`ALTER TABLE tenants ADD COLUMN owner_user_id INTEGER REFERENCES users(id)`)
       db.exec(`CREATE INDEX IF NOT EXISTS idx_tenants_owner_user_id ON tenants(owner_user_id)`)
     }
+  },
+  {
+    id: '052_tenant_activity',
+    up(db: Database.Database) {
+      // Last time MC brokered a gateway connection for this tenant. Drives the
+      // idle auto-suspend sweeper (suspend when now - last_active_at > idle window).
+      db.exec(`ALTER TABLE tenants ADD COLUMN last_active_at INTEGER DEFAULT NULL`)
+    }
   }
 ]
 
