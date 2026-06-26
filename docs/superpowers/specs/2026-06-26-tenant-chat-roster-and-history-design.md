@@ -1,116 +1,147 @@
 # Tenant Chat — Agent Roster + History-Pull — Design
 
 Date: 2026-06-26
-Status: design agreed (brainstorming). Implementation plan not yet written.
+Status: design agreed + reviewed (3 specialist reviews folded in: ready-with-changes → resolved).
 Scope: completes P1 of the unified scoped console
 (`2026-06-26-unified-scoped-console-design.md`) for a **viewer** in their own pod.
 
 ## 1. Context
 
 P1 re-sourced the chat/sessions/transcript panels to the pod gateway over `/ws/gateway`
-(committed: `9c56360`). Browser verification (viewer `alice`) confirmed sessions list, history
-load, and send all round-trip against the pod. Two gaps remain before P1 is truly usable:
+(committed `9c56360`). Browser verification (viewer `alice`) confirmed sessions list, history
+load, and send round-trip against the pod. Two gaps remain before P1 is usable:
 
 1. **No new-conversation roster.** `chat-workspace.tsx loadAgents()` and `conversation-list.tsx`
-   still fetch the host `/api/agents`, which a viewer is 403'd from (console:
-   `ChatWorkspace: Failed to load agents: Insufficient permissions`). So a viewer can continue an
-   existing session but cannot **start a new conversation**, and the "N online" / per-conversation
-   status are empty.
-2. **Reply delivery depends on a live WS stream.** Task 4 removed the original REST message poll
-   and relies on `chat.message` WS events. Those only arrive while the user is connected and
-   watching; navigating away, closing the UI, or a scale-to-zero suspend loses them.
+   still fetch host `/api/agents` (viewer 403: `ChatWorkspace: Failed to load agents`). A viewer can
+   continue an existing session but cannot start a new conversation; "N online" / status are empty.
+2. **Reply delivery depends on a live WS stream.** P1 removed the original REST message poll and
+   relies on `chat.message` WS events, which only arrive while connected and watching; navigating
+   away, closing the UI, or scale-to-zero loses them.
 
 ## 2. Verified facts (live, 2026-06-26)
 
-- **`agents.list`** (pod gateway) → `{ defaultId:"main", mainKey:"main", scope:"per-sender",
-  agents:[{ id:"main" }] }`. A single-tenant pod has **one agent (`main`)**; only `id` is
-  available per agent (no status/role/model).
-- **`models.list`** → full Bedrock Claude catalog (model choice is real, but not used in this spec).
-- **Session key form** is `agent:<agentId>:<bareKey>` (e.g. `agent:main:main`); the gateway
-  auto-creates a session on first `chat.send` to a new key (observed via probes).
-- **vLLM backend** `192.168.0.41:18032` (OpenAI-compatible) responds: http 200, `GPT-OSS-120B`
-  loaded, `/v1/chat/completions` works. Pod egress already allows `192.168.0.41/32:18032`.
-  **Caveat:** GPT-OSS-120B is a *reasoning* model — under a tight token budget the text lands in
-  a `reasoning` field with `content:null` (`finish_reason:"length"`). Whether the openclaw agent
-  surfaces a visible turn is a **pod-agent-config** concern (see §6), not MC re-sourcing.
+- **`agents.list`** → `{ defaultId:"main", mainKey:"main", scope:"per-sender", agents:[{ id:"main" }] }`.
+  One agent (`main`) today; only `id` per agent (no status/role/model).
+- **`models.list`** → full Bedrock Claude catalog (real model choice exists; unused here).
+- **Session key form** `agent:<agentId>:<bareKey>`; gateway auto-creates a session on first
+  `chat.send` to a new key.
+- **vLLM backend** `192.168.0.41:18032` (OpenAI-compatible) responds (http 200, `GPT-OSS-120B`,
+  `/v1/chat/completions` ok); pod egress allows it. **Caveat:** GPT-OSS-120B is a *reasoning* model —
+  under a tight token budget output lands in `reasoning` with `content:null`
+  (`finish_reason:"length"`); `gatewayMessageToChatMessage` returns `null` for an empty-text turn
+  (`gateway-adapters.ts:275`), so such a turn renders nowhere.
+
+### 2b. To confirm during implementation (review-flagged, cheap probes)
+- **`chat.history` survives suspend/resume** (the linchpin of §4): suspend the pod, reopen, confirm
+  the turn persists.
+- **`chat.history` echoes the USER turn** (not just assistant): else the poll's merge could drop the
+  user's message (see §4a merge contract).
+- **Does a `chat.history` poll stamp `last-active`** on the pod (reset the idle timer)? Determines
+  whether a left-open panel pins the pod awake (§4a mitigation).
 
 ## 3. Item 2 — Agent roster from `agents.list` (wired for N agents)
 
-The UX (an agent picker that starts a direct conversation) is **kept**, because OpenClaw supports
-multiple agents per pod; today there is one (`main`) but the wiring must scale to N.
+Keep the agent-picker UX (OpenClaw is multi-agent; one agent today, wiring must scale to N).
 
-### 3a. Data-source swap
-Replace the host REST roster with the gateway method, in both consumers:
+### 3a. Data-source swap (name ALL call sites)
 - `chat-workspace.tsx` `loadAgents()` (~:82-94): `apiFetch('/api/agents')` → `call('agents.list')`.
-- `conversation-list.tsx` agent rows (~:237-251): consume the same gateway-sourced `agents`.
+- The real new-conversation handler is **`chat-workspace.tsx handleNewConversation` (~:213)** (passed
+  as `onNewConversation` at ~:395) — change it (not only `conversation-list.tsx`).
+- **Remove the now-orphaned legacy `agent_` paths:** `handleNewConversation` building `agent_${name}`
+  (~:214) and `handleSend`'s `to = activeConversation.replace('agent_', '')` (~:152-154) become dead
+  once keys are gateway form — delete them; derive any needed agent id via `agentFromKey()`
+  (`gateway-adapters.ts:65`).
+- Display: header/status do `.replace('agent_', '')` (~:406-414, ~:902-914) — map the active gateway
+  key back through `agentFromKey()` for the agent name, else the header literally shows
+  `agent:main:main`.
 
 ### 3b. Adapter (pure, TDD)
-Add `gatewayAgentsToAgents(result)` to `src/components/chat/gateway-adapters.ts`:
-- Maps the **full `agents[]` array** → the UI `Agent[]` shape, so N agents "just work".
-- Available field is `id` only → `name = id`; synthesize the rest: `status` defaults to a
-  non-fabricated "available" (the agent is reachable whenever the pod is connected), `role`/`model`
-  left blank/optional. Carry `defaultId`/`mainKey` through for §3c.
-- Tolerant of empty/malformed (returns `[]`).
+Add `gatewayAgentsToAgents(result)` to `gateway-adapters.ts`, mirroring the existing tolerant pure
+pattern (returns `[]` on junk). Maps the **full `agents[]` array** → UI `Agent[]`:
+- `name = agent.id`; `id` (numeric, required) = array index + 1 (stable identity is all it needs —
+  `renderAgentItem` keys on `name`); `role = ''`; `created_at`/`updated_at` = 0; **`status = 'idle'`**
+  (see §3d). Return `mainKey`/`defaultId` to the caller **separately** (not threaded into each
+  `Agent`) for §3c key-building.
+- Unit test includes a **synthetic 2-agent fixture** to prove the "scales to N" claim, plus
+  empty/malformed cases.
 
 ### 3c. Agent → session-key mapping (the crux)
-Today clicking an agent opens a host-chat `convId = agent_<name>` (`conversation-list.tsx:244`),
-which is **not** a gateway session key, so `chat.send`/`chat.history` (keyed by `sessionKey`) would
-not work. Fix: clicking agent `X` opens that agent's **primary session** `agent:X:main` (using the
-gateway `mainKey`), i.e. `onNewConversation` sets `activeConversation` to a real gateway session
-key. Sending to it auto-creates the session in the pod if absent. Multi-session creation per agent
-(a fresh `agent:X:<newKey>` per "new chat") is **out of scope** (YAGNI; add later).
+Clicking agent `X` opens that agent's primary session, keyed `agent:${X}:${mainKey}` using the
+`mainKey` field from `agents.list` (**not** a hard-coded `"main"`). Set `activeConversation` to that
+gateway key so `chat.send`/`chat.history` (which key on `sessionKey`) work. **Reconcile identity
+(review A3/C1):** if `conversations` already has a row whose `session.sessionKey` equals that key
+(from `sessions.list`, whose row `id` is `session:gateway:<sessionId>`), select **that existing row**
+instead of the raw key — avoids a phantom duplicate entry. Otherwise use the raw key (session is
+auto-created on first send).
+**P1 limitation (explicit):** one persistent conversation per agent — clicking reopens the existing
+thread, it does **not** fork a new one. Multi-session-per-agent + a model picker are out of scope.
 
-### 3d. "N online" / status
-`agents.list` has no per-agent status. Do **not** fabricate busy/idle. Show online state as
-**pod-connected (`isConnected`) + agent count**; per-conversation status degrades to a neutral
-label rather than a fake agent state.
+### 3d. Status / "N online"
+`agents.list` has no per-agent status. Map a reachable agent to **`status:'idle'`** (the existing
+filters at `chat-workspace.tsx:338` and `conversation-list.tsx:246` test `idle|busy`, so `'idle'`
+reads correctly as "online, not busy" with zero consumer edits). This is the laziest correct value;
+do not invent `busy`. "N online" then = count of reachable agents while the pod is connected.
 
-## 4. Item 1 — Reply delivery via history pull (`chat.history` is the source of truth)
+## 4. Item 1 — Reply delivery via history pull (single source of truth)
 
-The pod-persisted transcript — not the live event stream — is authoritative. `chat.history` lives
-on the pod PVC and survives navigation, UI close, and scale-to-zero (the broker auto-wakes the pod
-on reconnect). The user is **not** expected to watch replies in real time.
+`chat.history` (pod PVC, survives navigation/close/suspend — §2b) is authoritative. The user is not
+expected to watch replies live.
 
-### 4a. Mechanism
-- Fetch `chat.history` on **session open/select** (already wired) **and** poll it on a **loose
-  interval (5–10s) while a session is open** (re-introducing the pull the original UI had, via the
-  existing `useSmartPoll`). On return/reopen, the completed reply always renders.
-- The live `chat.message` WS event stays as an **opportunistic** real-time update only — kept if it
-  remains cheap/already-wired; correctness must not depend on it. If it complicates, drop it.
-- Polling stamps last-active only while the chat panel is open; closing it lets the pod idle-suspend
-  normally (consistent with the operator-owned scale-to-zero model).
+### 4a. Mechanism — ONE source (drop the WS path for this feature)
+- Fetch `chat.history` on session open/select (already wired) **and** poll it on a fixed **10s**
+  interval while a session is open, via the existing `useSmartPoll` with **`pauseWhenDisconnected:
+  true, backoff: true`** (do **not** pass `pauseWhenSseConnected` — the poll must run while the WS is
+  up). `useSmartPoll` already pauses when the tab is hidden.
+- **Do NOT wire or depend on the `chat.message` WS event for replies.** Leave the handler
+  (`websocket.ts:612-627`) untouched for other consumers, but it is not a reply source here. (Three
+  id spaces — optimistic negative ids, WS server ids, history `timestamp+index` ids — never
+  reconcile via the positive-id-only `addChatMessage` dedup, so keeping it would duplicate turns.)
+- **Merge contract (do NOT blind-replace):** the poll currently `setChatMessages(mapped)` full-replace
+  (`chat-workspace.tsx:116`), which would wipe the in-flight optimistic user bubble (negative id,
+  `:158-171`). Instead: render = `mappedHistory` **plus** any optimistic message whose
+  `pendingStatus` is `sending`/`failed` and whose content is not yet present in `mappedHistory` for
+  this session. Once history contains the user's turn, the optimistic copy drops naturally.
+- Poll is read-only (`chat.history`); it never re-issues `chat.send`, so no idempotency interaction.
+- Pod-awake interaction: if a `chat.history` poll stamps `last-active` (§2b), a left-open panel keeps
+  the pod awake until the tab is hidden/closed; accept this for P1 (tab-hidden pause + 10s cadence is
+  the mitigation). If §2b shows it does not stamp, even better.
 
-### 4b. Verification (reframed — not "live streaming")
-Prove, via Playwright as viewer `alice`: send a message → the agent reply **persists in
-`chat.history`** → the UI renders it on poll/refresh/re-entry. Screenshot of user message + agent
-reply, sourced over `/ws/gateway`.
+### 4b. Verification
+Split so the MC change is verifiable independent of the model:
+- **(MC-owned, must pass)** A turn that EXISTS in `chat.history` renders in the viewer's chat on
+  poll/refresh/re-entry (Playwright). Seed/guarantee a persisted turn by giving the run an adequate
+  `max_tokens` (the `content:null` symptom is a token-budget artifact) or pointing the pod agent at a
+  content-emitting model from `models.list` — either makes this demonstrable now.
+- **(pod-config, may defer)** The live GPT-OSS-120B agent persists a visible turn unaided. If it
+  doesn't (reasoning-only), file the separate pod-agent issue (§6) — Item 1 is still verifiably done.
+- Also verify §2b: history survives a suspend/resume; the user turn is echoed by `chat.history`.
 
 ## 5. Components / files
-
-- `src/components/chat/gateway-adapters.ts` — add `gatewayAgentsToAgents` (+ unit tests in
-  `__tests__/gateway-adapters.test.ts`).
-- `src/components/chat/chat-workspace.tsx` — `loadAgents()` → gateway; re-add loose `chat.history`
-  poll while a session is open; demote the WS `chat.message` path to opportunistic.
-- `src/components/chat/conversation-list.tsx` — agent rows from gateway roster; `onNewConversation`
-  maps agent → `agent:<id>:main` session key.
-- No backend/broker/auth changes (the gateway already exposes `agents.list`; viewer auth unchanged).
+- `src/components/chat/gateway-adapters.ts` (+ `__tests__/gateway-adapters.test.ts`) —
+  `gatewayAgentsToAgents` (+ 2-agent fixture, key/display via existing `agentFromKey`).
+- `src/components/chat/chat-workspace.tsx` — `loadAgents()`→gateway; `handleNewConversation` key
+  mapping + identity reconcile; remove orphan `agent_` branches; header/status via `agentFromKey`;
+  add the 10s `chat.history` poll with the merge contract.
+- `src/components/chat/conversation-list.tsx` — agent rows from gateway roster; `renderAgentItem`
+  status read works as-is given §3d (`status:'idle'`).
+- No backend/broker/auth/websocket.ts changes.
 
 ## 6. Risks / out-of-scope
-
-- **Pod agent must persist a visible turn.** If the openclaw agent returns reasoning-only output
-  (`content:null`) and never writes a turn to `chat.history`, no UI mechanism can show a reply.
-  Verification step 1 confirms a turn is retrievable; if not, it is a **pod agent/model config
-  issue** filed separately, **not fixed here**.
-- **Multi-session-per-agent creation**, **model picker on new chat**, and **per-agent live status**
-  are out of scope (YAGNI).
-- In-flight run during a suspend (B2 known issue from lifecycle work) is unchanged here.
+- **Pod agent must persist a visible turn** — handled by the §4b split (MC-owned criterion no longer
+  depends on it). Reasoning-only/no-content output is a pod agent/model-config issue, filed
+  separately, not fixed here.
+- **Out of scope (YAGNI):** multi-session per agent, model picker on new chat, per-agent live status,
+  re-enabling a realtime WS stream.
+- In-flight run during suspend (lifecycle B2) unchanged.
 
 ## 7. Success criteria (verifiable)
-
-1. Viewer sees the agent roster (today: `main`) from `agents.list`; no `/api/agents` 403 from the
-   chat panel; the picker would render N agents unchanged if the pod had more.
-2. Clicking an agent opens `agent:<id>:main`; sending a message reaches the pod (`chat.send`).
-3. Agent reply appears in the viewer's chat **on poll/refresh/re-entry** (history pull), proven by
-   Playwright — independent of whether the user watched in real time.
-4. `gatewayAgentsToAgents` and the agent→session-key mapping are unit-tested (TDD).
-5. No regression in the committed P1 paths (sessions list, history load, send).
+1. Viewer sees the agent roster (today `main`) from `agents.list`; no `/api/agents` 403 from chat;
+   the picker renders N agents unchanged (proven by the 2-agent unit fixture).
+2. Clicking an agent opens `agent:<id>:<mainKey>` (or its existing session row); sending reaches the
+   pod (`chat.send`); the optimistic user bubble does not flicker/vanish under the poll (merge
+   contract).
+3a. **(must pass)** A persisted `chat.history` turn renders on poll/refresh/re-entry — Playwright,
+   model-independent.
+3b. **(may defer)** The live GPT-OSS agent emits a visible turn; if not, separate pod-config issue.
+4. `gatewayAgentsToAgents` and the agent→session-key mapping are unit-tested (TDD), incl. 2-agent.
+5. No regression in committed P1 paths (sessions list, history load, send); no `chat.message` wiring.
