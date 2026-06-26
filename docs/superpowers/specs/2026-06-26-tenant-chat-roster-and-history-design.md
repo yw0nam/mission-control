@@ -31,13 +31,25 @@ load, and send round-trip against the pod. Two gaps remain before P1 is usable:
   (`finish_reason:"length"`); `gatewayMessageToChatMessage` returns `null` for an empty-text turn
   (`gateway-adapters.ts:275`), so such a turn renders nowhere.
 
-### 2b. To confirm during implementation (review-flagged, cheap probes)
-- **`chat.history` survives suspend/resume** (the linchpin of §4): suspend the pod, reopen, confirm
-  the turn persists.
-- **`chat.history` echoes the USER turn** (not just assistant): else the poll's merge could drop the
-  user's message (see §4a merge contract).
-- **Does a `chat.history` poll stamp `last-active`** on the pod (reset the idle timer)? Determines
-  whether a left-open panel pins the pod awake (§4a mitigation).
+### 2b. Operator-grounded facts (repos = mission-control + openclaw-operator only; the openclaw
+gateway/agent runtime is the published image `ghcr.io/openclaw/openclaw` — no local source, so
+gateway-behavior facts are empirical probes)
+- **Transcripts persist across suspend — CONFIRMED in the operator.** It mounts a per-tenant RWO PVC
+  at `/home/openclaw/.openclaw` with retain-on-scale-to-zero/delete (`internal/resources/pvc.go`,
+  `statefulset.go`). So `chat.history` survives idle-suspend; §4's premise holds without a probe.
+- **Model / token / reasoning config is APP-LAYER, set via the CR `spec.config.raw`** (e.g.
+  `agents.defaults.model.*`, `models.providers.*`). The operator only injects API keys /
+  `OPENAI_BASE_URL` via `spec.env`/`envFrom` and force-protects `gateway.*` (`configmap.go`,
+  `docs/custom-providers.md`). → The §4b "make it demonstrable" knob and the §6 reasoning-only fix
+  are **CR `spec.config.raw` changes (operator/CR touch, outside MC)**, not a vLLM request param.
+- **`last-active` is stamped by the MC broker on EVERY browser→pod frame** (operator
+  `internal/controller/idlesuspend.go` reads the annotation; MC `reportActivity` writes it). So a 10s
+  `chat.history` poll DOES bump last-active → a left-open chat panel keeps the pod awake until the tab
+  is hidden (when `useSmartPoll` pauses). Accept for P1; tab-hidden pause is the mitigation (§4a).
+
+### 2c. Remaining live probe (gateway source unavailable)
+- **`chat.history` echoes the USER turn** (not only assistant): if not, the poll merge could drop the
+  user's own message — confirm live before relying on the §4a merge contract.
 
 ## 3. Item 2 — Agent roster from `agents.list` (wired for N agents)
 
@@ -109,9 +121,9 @@ expected to watch replies live.
 ### 4b. Verification
 Split so the MC change is verifiable independent of the model:
 - **(MC-owned, must pass)** A turn that EXISTS in `chat.history` renders in the viewer's chat on
-  poll/refresh/re-entry (Playwright). Seed/guarantee a persisted turn by giving the run an adequate
-  `max_tokens` (the `content:null` symptom is a token-budget artifact) or pointing the pod agent at a
-  content-emitting model from `models.list` — either makes this demonstrable now.
+  poll/refresh/re-entry (Playwright). Seed/guarantee a persisted turn via the pod's openclaw config
+  (CR `spec.config.raw`: a larger token budget or a content-emitting `agents.defaults.model`) — an
+  operator/CR change (§2b), outside MC, that makes this demonstrable now.
 - **(pod-config, may defer)** The live GPT-OSS-120B agent persists a visible turn unaided. If it
   doesn't (reasoning-only), file the separate pod-agent issue (§6) — Item 1 is still verifiably done.
 - Also verify §2b: history survives a suspend/resume; the user turn is echoed by `chat.history`.
@@ -128,8 +140,8 @@ Split so the MC change is verifiable independent of the model:
 
 ## 6. Risks / out-of-scope
 - **Pod agent must persist a visible turn** — handled by the §4b split (MC-owned criterion no longer
-  depends on it). Reasoning-only/no-content output is a pod agent/model-config issue, filed
-  separately, not fixed here.
+  depends on it). Reasoning-only/no-content output is fixed in the **CR `spec.config.raw`** (model /
+  token budget — operator-owned, §2b), not in MC; filed separately if it surfaces.
 - **Out of scope (YAGNI):** multi-session per agent, model picker on new chat, per-agent live status,
   re-enabling a realtime WS stream.
 - In-flight run during suspend (lifecycle B2) unchanged.
