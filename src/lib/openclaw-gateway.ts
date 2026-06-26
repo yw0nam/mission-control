@@ -25,6 +25,36 @@ interface CallGatewayOptions {
   expectFinal?: boolean
 }
 
+/**
+ * Build the gateway `connect` handshake frame. Single source of truth for the
+ * connect schema (protocol version, client identity, scopes, caps) shared by the
+ * programmatic RPC path here and the /ws/gateway broker, which must answer the
+ * connect.challenge server-side with the per-tenant token at params.auth.token.
+ */
+export function buildConnectFrame(token: string | undefined, id: string) {
+  return {
+    type: 'req',
+    method: 'connect',
+    id,
+    params: {
+      minProtocol: GATEWAY_PROTOCOL_VERSION,
+      maxProtocol: GATEWAY_PROTOCOL_VERSION,
+      client: {
+        id: GATEWAY_CLIENT_ID,
+        displayName: 'Mission Control',
+        version: APP_VERSION,
+        platform: 'server',
+        mode: 'backend',
+        instanceId: `mc-server-${process.pid}`,
+      },
+      role: 'operator',
+      scopes: GATEWAY_SCOPES,
+      caps: ['tool-events'],
+      auth: token ? { token } : undefined,
+    },
+  }
+}
+
 export function parseGatewayJsonOutput(raw: string): unknown | null {
   const trimmed = String(raw || '').trim()
   if (!trimmed) return null
@@ -135,27 +165,7 @@ export async function callOpenClawGateway<T = unknown>(
     const sendConnect = (_nonce?: string) => {
       if (connectSent || settled || ws.readyState !== WebSocket.OPEN) return
       connectSent = true
-      sendFrame({
-        type: 'req',
-        method: 'connect',
-        id: connectId,
-        params: {
-          minProtocol: GATEWAY_PROTOCOL_VERSION,
-          maxProtocol: GATEWAY_PROTOCOL_VERSION,
-          client: {
-            id: GATEWAY_CLIENT_ID,
-            displayName: 'Mission Control',
-            version: APP_VERSION,
-            platform: 'server',
-            mode: 'backend',
-            instanceId: `mc-server-${process.pid}`,
-          },
-          role: 'operator',
-          scopes: GATEWAY_SCOPES,
-          caps: ['tool-events'],
-          auth: token ? { token } : undefined,
-        },
-      })
+      sendFrame(buildConnectFrame(token, connectId))
     }
 
     const sendRequest = () => {

@@ -124,10 +124,13 @@ const gatewayOnlyPanels = new Set([
   'gateways', 'gateway-config', 'channels', 'nodes', 'exec-approvals',
   ...getPluginNavItems().filter(pi => pi.gatewayOnly).map(pi => pi.id),
 ])
-// PoC owner isolation: a non-admin (owner) sees ONLY their own instance panel —
-// every operator/host view is hidden. `my-instance` is hidden from admins (they
-// manage tenants from the admin views instead).
+// PoC owner isolation: a non-admin (owner/viewer) sees only the panels backed by
+// per-tenant (pod-scoped) data — their own instance lifecycle plus the chat
+// experience (conversation list + chat + transcript). Every host/operator view stays
+// hidden. `my-instance` is hidden from admins (they manage tenants from the admin
+// views instead). Extend this allowlist as more panels become pod-sourced.
 const OWNER_PANEL = 'my-instance'
+const VIEWER_VISIBLE = new Set(['my-instance', 'chat'])
 
 export function NavRail() {
   const { activeTab, connection, dashboardMode, currentUser, activeTenant, tenants, osUsers, setActiveTenant, fetchTenants, fetchOsUsers, activeProject, projects, setActiveProject, fetchProjects, sidebarExpanded, collapsedGroups, toggleSidebar, toggleGroup, defaultOrgName, interfaceMode, setInterfaceMode } = useMissionControl()
@@ -188,8 +191,8 @@ export function NavRail() {
           return { ...i, children: filteredChildren }
         }
         if (isLocal && gatewayOnlyPanels.has(i.id)) return null
-        // Owner sees only their instance; admin sees everything except the owner panel.
-        if (!isAdmin && i.id !== OWNER_PANEL) return null
+        // Viewer sees only the pod-backed allowlist; admin sees everything except the owner panel.
+        if (!isAdmin && !VIEWER_VISIBLE.has(i.id)) return null
         if (isAdmin && i.id === OWNER_PANEL) return null
         if (isEssential && !i.essential) return null
         return i

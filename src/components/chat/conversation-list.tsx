@@ -3,87 +3,14 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { useMissionControl, Conversation } from '@/store'
 import { useSmartPoll } from '@/lib/use-smart-poll'
+import { useWebSocket } from '@/lib/websocket'
 import { apiFetch, ApiError } from '@/lib/api-client'
 import { createClientLogger } from '@/lib/client-logger'
 import { Button } from '@/components/ui/button'
 import { SessionKindAvatar, SessionKindPill } from './session-kind-brand'
+import { gatewaySessionsToConversations } from './gateway-adapters'
 
 const log = createClientLogger('ConversationList')
-
-type SessionKind = 'claude-code' | 'codex-cli' | 'hermes' | 'opencode' | 'gateway'
-
-type SessionRecord = {
-  id: string
-  key?: string
-  agent?: string
-  kind?: string
-  source?: string
-  model?: string
-  tokens?: string
-  age?: string
-  active?: boolean
-  startTime?: number
-  lastActivity?: number
-  workingDir?: string | null
-  lastUserPrompt?: string | null
-}
-
-type SessionPrefs = Record<string, { name?: string; color?: string }>
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === 'object' ? (value as Record<string, unknown>) : null
-}
-
-function readString(value: unknown): string | undefined {
-  return typeof value === 'string' ? value : undefined
-}
-
-function readNumber(value: unknown): number | undefined {
-  return typeof value === 'number' ? value : undefined
-}
-
-function readSessionPrefs(payload: unknown): SessionPrefs {
-  const record = asRecord(payload)
-  const prefsRecord = asRecord(record?.prefs)
-  if (!prefsRecord) return {}
-
-  return Object.fromEntries(
-    Object.entries(prefsRecord).map(([key, value]) => {
-      const pref = asRecord(value)
-      return [key, {
-        name: readString(pref?.name),
-        color: readString(pref?.color),
-      }]
-    })
-  )
-}
-
-function readSessions(payload: unknown): SessionRecord[] {
-  const record = asRecord(payload)
-  const sessions = Array.isArray(record?.sessions) ? record.sessions : []
-
-  return sessions.flatMap((value) => {
-    const session = asRecord(value)
-    const id = readString(session?.id)
-    if (!id) return []
-
-    return [{
-      id,
-      key: readString(session?.key),
-      agent: readString(session?.agent),
-      kind: readString(session?.kind),
-      source: readString(session?.source),
-      model: readString(session?.model),
-      tokens: readString(session?.tokens),
-      age: readString(session?.age),
-      active: typeof session?.active === 'boolean' ? session.active : undefined,
-      startTime: readNumber(session?.startTime),
-      lastActivity: readNumber(session?.lastActivity),
-      workingDir: typeof session?.workingDir === 'string' || session?.workingDir === null ? session.workingDir : undefined,
-      lastUserPrompt: typeof session?.lastUserPrompt === 'string' || session?.lastUserPrompt === null ? session.lastUserPrompt : undefined,
-    }]
-  })
-}
 
 const COLOR_OPTIONS = [
   { value: '', label: 'None' },
@@ -139,6 +66,7 @@ export function ConversationList({ onNewConversation }: ConversationListProps) {
     addSplitPane,
     agents,
   } = useMissionControl()
+  const { call, isConnected } = useWebSocket()
   const [search, setSearch] = useState('')
   const [initialLoading, setInitialLoading] = useState(conversations.length === 0)
 
@@ -252,89 +180,26 @@ export function ConversationList({ onNewConversation }: ConversationListProps) {
   }
 
   const loadConversations = useCallback(async () => {
+    // Pod-owner (viewer) data source: the user's own pod gateway over the
+    // singleton WebSocket. Host REST routes (/api/sessions, session-prefs) 403
+    // viewers, so we re-source from `sessions.list` and derive name/color from
+    // the gateway session itself (pods have no host prefs table).
+    if (!isConnected) return
     try {
-      // apiFetch throws on non-OK / network errors. The originals used
-      // `.ok ? parse : default` for INDEPENDENT graceful degradation, so each
-      // request is caught on its own — a failed prefs fetch must not discard
-      // successfully-loaded sessions (and vice versa).
-      const [sessionsData, prefs] = await Promise.all([
-        apiFetch<unknown>('/api/sessions')
-          .then((payload) => readSessions(payload))
-          .catch(() => [] as SessionRecord[]),
-        apiFetch<unknown>('/api/chat/session-prefs')
-          .then((payload) => readSessionPrefs(payload))
-          .catch(() => ({} as SessionPrefs)),
-      ])
-
-      const providerSessions = sessionsData
-        .map((s, idx: number) => {
-          const lastActivityMs = Number(s.lastActivity || s.startTime || 0)
-          const updatedAt = lastActivityMs > 1_000_000_000_000
-            ? Math.floor(lastActivityMs / 1000)
-            : lastActivityMs
-          const sessionKind: SessionKind = s.kind === 'claude-code' || s.kind === 'codex-cli' || s.kind === 'hermes' || s.kind === 'opencode'
-            ? s.kind
-            : 'gateway'
-          const kindLabel = sessionKind === 'codex-cli'
-            ? 'Codex'
-            : sessionKind === 'claude-code'
-              ? 'Claude'
-              : sessionKind === 'hermes'
-                ? 'Hermes'
-                : sessionKind === 'opencode'
-                  ? 'OpenCode'
-                : 'Gateway'
-          const prefKey = `${sessionKind}:${s.id}`
-          const pref = prefs[prefKey] || {}
-          const defaultName = s.source === 'local'
-            ? `${kindLabel} • ${s.key || s.id}`
-            : `${s.agent || 'Gateway'} • ${s.key || s.id}`
-          const sessionName = pref.name || defaultName
-
-          return {
-            id: `session:${sessionKind}:${s.id}`,
-            name: sessionName,
-            kind: sessionKind,
-            source: 'session' as const,
-            session: {
-              prefKey,
-              sessionId: String(s.id),
-              sessionKey: s.key || undefined,
-              sessionKind,
-              agent: s.agent || undefined,
-              displayName: sessionName,
-              colorTag: typeof pref.color === 'string' ? pref.color : undefined,
-              model: s.model,
-              tokens: s.tokens,
-              workingDir: s.workingDir || null,
-              lastUserPrompt: s.lastUserPrompt || null,
-              active: !!s.active,
-              age: s.age,
-            },
-            participants: [],
-            lastMessage: {
-              id: Date.now() + idx,
-              conversation_id: `session:${sessionKind}:${s.id}`,
-              from_agent: 'system',
-              to_agent: null,
-              content: `${s.model || kindLabel} • ${s.tokens || ''}`.trim(),
-              message_type: 'system' as const,
-              created_at: updatedAt || Math.floor(Date.now() / 1000),
-            },
-            unreadCount: 0,
-            updatedAt,
-          }
-        })
-
-      setConversations(
-        providerSessions.sort((a: Conversation, b: Conversation) => b.updatedAt - a.updatedAt)
-      )
+      const result = await call('sessions.list', {})
+      setConversations(gatewaySessionsToConversations(result))
       setInitialLoading(false)
     } catch (err) {
       log.error('Failed to load conversations:', err)
       setInitialLoading(false)
     }
-  }, [setConversations])
+  }, [call, isConnected, setConversations])
+
+  // Initial fetch on connect + live refresh (the gateway also pushes
+  // session_update/tick events that keep the sessions store fresh).
+  useEffect(() => {
+    loadConversations()
+  }, [loadConversations])
 
   useSmartPoll(loadConversations, 30000, { pauseWhenSseConnected: true })
 
