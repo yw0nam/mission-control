@@ -1,7 +1,7 @@
 # Tenant Chat — Agent Roster + History-Pull — Design
 
-Date: 2026-06-26
-Status: design agreed + reviewed (3 specialist reviews folded in: ready-with-changes → resolved).
+Date: 2026-06-26 (validated + finalized 2026-06-29)
+Status: design agreed + reviewed (3 specialist reviews folded in) + risky assumptions live-validated.
 Scope: completes P1 of the unified scoped console
 (`2026-06-26-unified-scoped-console-design.md`) for a **viewer** in their own pod.
 
@@ -26,10 +26,11 @@ load, and send round-trip against the pod. Two gaps remain before P1 is usable:
 - **Session key form** `agent:<agentId>:<bareKey>`; gateway auto-creates a session on first
   `chat.send` to a new key.
 - **vLLM backend** `192.168.0.41:18032` (OpenAI-compatible) responds (http 200, `GPT-OSS-120B`,
-  `/v1/chat/completions` ok); pod egress allows it. **Caveat:** GPT-OSS-120B is a *reasoning* model —
-  under a tight token budget output lands in `reasoning` with `content:null`
-  (`finish_reason:"length"`); `gatewayMessageToChatMessage` returns `null` for an empty-text turn
-  (`gateway-adapters.ts:275`), so such a turn renders nowhere.
+  `/v1/chat/completions` ok); pod egress allows it. GPT-OSS-120B is a *reasoning* model. With the
+  provider wired correctly (`models.providers.vllm`: `api:"openai-completions"`, model marked
+  `reasoning:true`, `maxTokens:8192`) it emits a `thinking` block **and** a `text` block, both of
+  which persist — see §2d. A residual edge: `gatewayMessageToChatMessage` returns `null` for a
+  *pure-thinking* turn with no text (`gateway-adapters.ts:275`); real turns carry text so this is rare.
 
 ### 2b. Operator-grounded facts (repos = mission-control + openclaw-operator only; the openclaw
 gateway/agent runtime is the published image `ghcr.io/openclaw/openclaw` — no local source, so
@@ -47,9 +48,25 @@ gateway-behavior facts are empirical probes)
   `chat.history` poll DOES bump last-active → a left-open chat panel keeps the pod awake until the tab
   is hidden (when `useSmartPoll` pauses). Accept for P1; tab-hidden pause is the mitigation (§4a).
 
-### 2c. Remaining live probe (gateway source unavailable)
-- **`chat.history` echoes the USER turn** (not only assistant): if not, the poll merge could drop the
-  user's own message — confirm live before relying on the §4a merge contract.
+### 2c. Provisioning prerequisite (operator/CR, NOT MC) — root cause of "no replies"
+The earlier "send works but no reply ever appears" symptom was **not** an MC or openclaw limitation:
+alice's pod had `model.primary` set but **no provider wired** (no `OPENAI_BASE_URL`, no
+`models.providers.*`), so every run failed to produce a turn. Fixed by replacing the CR's
+`/spec/config/raw` (mergeMode `overwrite`) with a `models.providers.vllm` block + model ref
+`vllm/GPT-OSS-120B`. **Implication for the spec:** a tenant pod with chat enabled MUST have its model
+provider wired at provision time, or chat produces no replies — this is an operator/CR concern,
+tracked separately from MC. (Gotcha for whoever wires it: `kubectl patch --type merge` *recursively
+merges* `spec.config.raw` and never removes stale keys → crashloops; use `--type=json` `replace` on
+`/spec/config/raw` to swap the whole subtree.)
+
+### 2d. Live validation — chat.history persists & echoes BOTH turns (CONFIRMED 2026-06-29)
+After wiring (§2c), a `chat.send` → poll `chat.history` probe returned, at **t≈4s**, two messages:
+`user[text]` **and** `assistant[thinking|text]`. This decisively confirms the assumptions §4 depends on:
+- `chat.history` **echoes the USER turn** (not only assistant) — so the §4a merge contract is sound
+  (the poll reflects the user's own message within seconds; the optimistic bubble drops naturally).
+- The assistant turn **persists with thinking+text content** within ~4s — so a 10s poll easily catches
+  it, and the history-pull-as-single-source premise (§4) holds.
+- `chat`/`agent` events also stream during the run (bonus; not relied upon — §4a keeps WS out).
 
 ## 3. Item 2 — Agent roster from `agents.list` (wired for N agents)
 
@@ -85,8 +102,11 @@ gateway key so `chat.send`/`chat.history` (which key on `sessionKey`) work. **Re
 (from `sessions.list`, whose row `id` is `session:gateway:<sessionId>`), select **that existing row**
 instead of the raw key — avoids a phantom duplicate entry. Otherwise use the raw key (session is
 auto-created on first send).
-**P1 limitation (explicit):** one persistent conversation per agent — clicking reopens the existing
-thread, it does **not** fork a new one. Multi-session-per-agent + a model picker are out of scope.
+**New-conversation UX (user-confirmed 2026-06-29):** keep MC's existing agent-picker click behavior —
+clicking agent `X` **reopens its existing session if one exists, otherwise opens a new session** (the
+raw key auto-creates on first send). This is exactly the reconcile above; no forking of a second
+thread per agent. Note multi-session-per-agent is technically free (a fresh bareKey yields a distinct
+session), but it is **deliberately not exposed** in P1 — kept out of scope with the model picker.
 
 ### 3d. Status / "N online"
 `agents.list` has no per-agent status. Map a reachable agent to **`status:'idle'`** (the existing
@@ -124,9 +144,11 @@ Split so the MC change is verifiable independent of the model:
   poll/refresh/re-entry (Playwright). Seed/guarantee a persisted turn via the pod's openclaw config
   (CR `spec.config.raw`: a larger token budget or a content-emitting `agents.defaults.model`) — an
   operator/CR change (§2b), outside MC, that makes this demonstrable now.
-- **(pod-config, may defer)** The live GPT-OSS-120B agent persists a visible turn unaided. If it
-  doesn't (reasoning-only), file the separate pod-agent issue (§6) — Item 1 is still verifiably done.
-- Also verify §2b: history survives a suspend/resume; the user turn is echoed by `chat.history`.
+- **(pod-config, DONE on alice)** The live GPT-OSS-120B agent persists a visible turn — validated
+  §2d (assistant `thinking|text` at t≈4s) once the provider was wired (§2c). For other tenant pods
+  this reduces to the provisioning prerequisite (§2c), not an MC task.
+- §2b/§2d already covered: `chat.history` echoes the user turn (CONFIRMED §2d); history persists on
+  the PVC across suspend/resume (operator-grounded §2b).
 
 ## 5. Components / files
 - `src/components/chat/gateway-adapters.ts` (+ `__tests__/gateway-adapters.test.ts`) —
@@ -139,9 +161,8 @@ Split so the MC change is verifiable independent of the model:
 - No backend/broker/auth/websocket.ts changes.
 
 ## 6. Risks / out-of-scope
-- **Pod agent must persist a visible turn** — handled by the §4b split (MC-owned criterion no longer
-  depends on it). Reasoning-only/no-content output is fixed in the **CR `spec.config.raw`** (model /
-  token budget — operator-owned, §2b), not in MC; filed separately if it surfaces.
+- **Pod agent must persist a visible turn** — VALIDATED on alice (§2d). The general case reduces to
+  the provisioning prerequisite (§2c: provider wired in CR `spec.config.raw`), operator-owned, not MC.
 - **Out of scope (YAGNI):** multi-session per agent, model picker on new chat, per-agent live status,
   re-enabling a realtime WS stream.
 - In-flight run during suspend (lifecycle B2) unchanged.
@@ -154,6 +175,7 @@ Split so the MC change is verifiable independent of the model:
    contract).
 3a. **(must pass)** A persisted `chat.history` turn renders on poll/refresh/re-entry — Playwright,
    model-independent.
-3b. **(may defer)** The live GPT-OSS agent emits a visible turn; if not, separate pod-config issue.
+3b. **(validated §2d)** The live GPT-OSS agent emits a visible `thinking|text` turn (provider wired,
+   §2c); for other pods this is the §2c provisioning prerequisite, not an MC criterion.
 4. `gatewayAgentsToAgents` and the agent→session-key mapping are unit-tested (TDD), incl. 2-agent.
 5. No regression in committed P1 paths (sessions list, history load, send); no `chat.message` wiring.
