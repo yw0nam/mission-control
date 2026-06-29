@@ -1,11 +1,12 @@
 'use client'
 
 import { useEffect, useCallback, useState, useRef } from 'react'
-import { useMissionControl, type Conversation, type ChatAttachment, type Agent, type ChatMessage } from '@/store'
+import { useMissionControl, type Conversation, type ChatAttachment, type ChatMessage } from '@/store'
 import { apiFetch, ApiError } from '@/lib/api-client'
 import { useWebSocket } from '@/lib/websocket'
 import { createClientLogger } from '@/lib/client-logger'
-import { gatewayHistoryToTranscript, gatewayMessageToChatMessage } from './gateway-adapters'
+import { gatewayHistoryToTranscript, gatewayMessageToChatMessage, gatewayAgentsToAgents, agentFromKey, mergeHistoryWithPending } from './gateway-adapters'
+import { useSmartPoll } from '@/lib/use-smart-poll'
 import { ConversationList } from './conversation-list'
 import { MessageList } from './message-list'
 import { ChatInput } from './chat-input'
@@ -36,6 +37,7 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
     setConversations,
     addChatMessage,
     updatePendingMessage,
+    chatMessages,
     agents,
     conversations,
     setAgents,
@@ -48,6 +50,11 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
   const { call, isConnected } = useWebSocket()
 
   const pendingIdRef = useRef(-1)
+  const mainKeyRef = useRef<string | undefined>(undefined)
+  // Keep the latest messages in a ref so loadMessages' merge can read them
+  // without re-creating the callback (which would restart the history poll).
+  const chatMessagesRef = useRef(chatMessages)
+  chatMessagesRef.current = chatMessages
 
   const [showConversations, setShowConversations] = useState(true)
   const [isMobile, setIsMobile] = useState(false)
@@ -61,6 +68,16 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
   const isOverlay = mode === 'overlay'
   const selectedConversation = conversations.find((c) => c.id === activeConversation)
   const selectedSession = selectedConversation?.session
+  // Agent name for the header: derive from the gateway session key
+  // (`agent:<id>:<rest>`), not the raw activeConversation id (a sessions.list row
+  // id is `session:gateway:<id>` → no agent). When activeConversation is itself a
+  // raw `agent:<id>:<key>` (new conversation, no row yet), read it directly.
+  const agentDisplayName =
+    (selectedSession?.sessionKey && agentFromKey(selectedSession.sessionKey)) ||
+    (activeConversation && agentFromKey(activeConversation)) ||
+    selectedConversation?.name ||
+    activeConversation ||
+    ''
 
   // Detect mobile
   useEffect(() => {
@@ -77,28 +94,32 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
     }
   }, [isMobile, activeConversation])
 
-  // Load agents list
+  // Load agents list from the pod gateway (`agents.list`); host /api/agents 403s
+  // pod-owner viewers. `mainKey` is stashed for new-conversation key building.
   useEffect(() => {
     async function loadAgents() {
+      if (!isConnected) return
       try {
-        const data = await apiFetch<{ agents?: Agent[] }>('/api/agents')
-        if (data.agents) setAgents(data.agents)
+        const result = await call('agents.list', {})
+        const { agents: mapped, mainKey } = gatewayAgentsToAgents(result)
+        mainKeyRef.current = mainKey
+        setAgents(mapped)
       } catch (err) {
-        // Graceful degradation: apiFetch throws on non-2xx (where the
-        // original `if (!res.ok) return` returned silently). Swallow here so
-        // the agents list simply stays empty instead of crashing the panel.
+        // Graceful degradation: leave the agents list empty instead of
+        // crashing the panel.
+        setAgents([])
         log.error('Failed to load agents:', err)
       }
     }
 
     loadAgents()
-  }, [setAgents])
+  }, [setAgents, call, isConnected])
 
   // Load messages when conversation changes. `session:` conversations render via
   // the transcript path (SessionConversationView) below, so we only fetch direct
-  // `agent_<name>` chat history here. The conversation id IS the gateway session
-  // key — fetch it via `chat.history` over the pod WebSocket instead of the
-  // host REST route (which 403s pod-owner viewers).
+  // agent chat history here. The conversation id IS the gateway session key
+  // (`agent:<id>:<rest>`) — fetch it via `chat.history` over the pod WebSocket
+  // instead of the host REST route (which 403s pod-owner viewers).
   const loadMessages = useCallback(async () => {
     if (!activeConversation) return
     if (activeConversation.startsWith('session:')) {
@@ -113,19 +134,26 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
       const mapped = raw
         .map((m, i) => gatewayMessageToChatMessage(m, activeConversation, i))
         .filter((m): m is ChatMessage => m !== null)
-      setChatMessages(mapped)
+      // Merge (not blind-replace) so an in-flight optimistic bubble survives the
+      // poll until history echoes the user's turn back (see §4a merge contract).
+      const current = chatMessagesRef.current.filter((m) => m.conversation_id === activeConversation)
+      setChatMessages(mergeHistoryWithPending(mapped, current))
     } catch (err) {
       // Swallow so a transient gateway error keeps the current messages instead
-      // of clearing the panel. Live updates arrive via WS `chat.message` events.
+      // of clearing the panel.
       log.error('Failed to load messages:', err)
     }
   }, [activeConversation, isConnected, call, setChatMessages])
 
-  // Fetch on conversation-select / (re)connect. Real-time updates flow through
-  // the WS `chat.message` events handled in the websocket hook — no REST poll.
+  // Fetch on conversation-select / (re)connect, then poll `chat.history` every
+  // 10s while the session is open. History (pod PVC) is the single source of
+  // truth for replies; the poll keeps the panel fresh without relying on WS
+  // `chat.message` events (§4a). useSmartPoll pauses when the tab is hidden.
   useEffect(() => {
     loadMessages()
   }, [loadMessages])
+
+  useSmartPoll(loadMessages, 10000, { pauseWhenDisconnected: true, backoff: true })
 
   // Close on Escape (overlay mode)
   useEffect(() => {
@@ -146,12 +174,8 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
     if (!activeConversation) return
 
     const mentionMatch = content.match(/^@(\w+)\s/)
-    let to = mentionMatch ? mentionMatch[1] : null
+    const to = mentionMatch ? mentionMatch[1] : null
     const cleanContent = mentionMatch ? content.slice(mentionMatch[0].length) : content
-
-    if (!to && activeConversation.startsWith('agent_')) {
-      to = activeConversation.replace('agent_', '')
-    }
 
     // Create optimistic message with negative temp ID
     pendingIdRef.current -= 1
@@ -211,8 +235,14 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
   }, [activeConversation])
 
   const handleNewConversation = (agentName: string) => {
-    const convId = `agent_${agentName}`
-    setActiveConversation(convId)
+    // Open the agent's primary session keyed `agent:<id>:<mainKey>`. Always use
+    // the raw gateway key (never a sessions.list row id): the key is stable so it
+    // reopens the same session's history, and it routes to the direct-agent chat
+    // view (MessageList + 10s chat.history poll + enabled composer) — a `session:`
+    // row id renders the un-polled transcript view instead. The same session may
+    // also appear as a list row; that is harmless.
+    const key = `agent:${agentName}:${mainKeyRef.current ?? 'main'}`
+    setActiveConversation(key)
     if (isMobile) setShowConversations(false)
   }
 
@@ -403,12 +433,12 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
             {activeConversation && splitPanes.length === 0 && (
               <div className="bg-surface-1 flex flex-shrink-0 items-center gap-2 border-b border-border/50 px-4 py-2">
                 <AgentAvatar
-                  name={(selectedConversation?.name || activeConversation).replace('agent_', '')}
+                  name={agentDisplayName}
                   size="sm"
                 />
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-sm font-medium text-foreground">
-                    {(selectedConversation?.name || activeConversation).replace('agent_', '')}
+                    {agentDisplayName}
                   </div>
                   <div className="text-[10px] text-muted-foreground">
                     {getConversationStatus(agents, activeConversation)}
@@ -907,7 +937,8 @@ function getConversationStatus(agents: Array<{ name: string; status: string }>, 
     if (conversationId.includes('opencode')) return 'Local OpenCode session'
     return 'Gateway session'
   }
-  const name = conversationId.replace('agent_', '')
+  // Gateway key form `agent:<id>:<rest>`; fall back to the bare id otherwise.
+  const name = agentFromKey(conversationId) ?? conversationId
   const agent = agents.find(a => a.name.toLowerCase() === name.toLowerCase())
   if (!agent) return 'Unknown'
   return agent.status === 'idle' || agent.status === 'busy' ? 'Online' : 'Offline'

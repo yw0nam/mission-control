@@ -8,7 +8,7 @@ import { apiFetch, ApiError } from '@/lib/api-client'
 import { createClientLogger } from '@/lib/client-logger'
 import { Button } from '@/components/ui/button'
 import { SessionKindAvatar, SessionKindPill } from './session-kind-brand'
-import { gatewaySessionsToConversations } from './gateway-adapters'
+import { gatewaySessionsToConversations, agentFromKey } from './gateway-adapters'
 
 const log = createClientLogger('ConversationList')
 
@@ -241,8 +241,9 @@ export function ConversationList({ onNewConversation }: ConversationListProps) {
   })
 
   function renderAgentItem(agent: { name: string; status?: string }) {
-    const convId = `agent_${agent.name}`
-    const isSelected = activeConversation === convId
+    // The active direct-agent conversation is the raw gateway key
+    // `agent:<name>:<mainKey>`; highlight this row when that key's agent matches.
+    const isSelected = agentFromKey(activeConversation || '') === agent.name
     const online = agent.status === 'idle' || agent.status === 'busy'
     return (
       <button

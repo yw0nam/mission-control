@@ -103,12 +103,18 @@ pattern (returns `[]` on junk). Maps the **full `agents[]` array** → UI `Agent
 ### 3c. Agent → session-key mapping (the crux)
 Clicking agent `X` opens that agent's primary session, keyed `agent:${X}:${mainKey}` using the
 `mainKey` field from `agents.list` (**not** a hard-coded `"main"`). Set `activeConversation` to that
-gateway key so `chat.send`/`chat.history` (which key on `sessionKey`) work. **Reconcile identity
-(review A3/C1):** if `conversations` already has a row whose `session.sessionKey` equals that key
-(from `sessions.list`, whose row `id` is `session:gateway:<sessionId>`), select **that existing row**
-instead of the raw key — avoids a phantom duplicate entry. Otherwise use the raw key (session is
-auto-created on first send). **Keep this to one `conversations.find(c => c.session?.sessionKey === key)`
-with a raw-key fallback — no key-normalization helper, no lookup map.**
+**raw gateway key** — always, never a `sessions.list` row id.
+
+**Do NOT reconcile to an existing `session:gateway:<id>` row (correction, live-validated 2026-06-29).**
+An earlier draft selected the matching session-list row when one existed (to avoid a "phantom
+duplicate"). In practice that routes the click into the `SessionConversationView` path, which (a) is
+**not** covered by the §4a 10s `chat.history` poll, and (b) flips to an empty view after send when the
+re-fetched conversations list momentarily drops the selected row. The raw gateway key instead routes
+to the direct-agent view (`MessageList` + the §4a poll + an enabled composer), and the key is stable,
+so it **reopens the same session's history** on every click — satisfying "reopen existing, else new"
+(`canSendMessage` is true because the id does not start with `session:`; `chat.send`/`chat.history`
+key on `sessionKey === activeConversation`). The session may also appear as a `sessions.list` row;
+that duplicate listing is harmless. Net: `setActiveConversation(`agent:${X}:${mainKey}`)`, no `.find`.
 **New-conversation UX (user-confirmed 2026-06-29):** keep MC's existing agent-picker click behavior —
 clicking agent `X` **reopens its existing session if one exists, otherwise opens a new session** (the
 raw key auto-creates on first send). This is exactly the reconcile above; no forking of a second

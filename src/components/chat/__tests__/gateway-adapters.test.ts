@@ -5,8 +5,11 @@ import {
   gatewayColorTag,
   gatewayHistoryToTranscript,
   gatewayMessageToChatMessage,
+  gatewayAgentsToAgents,
+  mergeHistoryWithPending,
   type GatewaySession,
 } from '../gateway-adapters'
+import type { ChatMessage } from '@/store'
 
 // Fixtures captured from the REAL pod gateway (tenant alice, broker /ws/gateway)
 // via scratchpad probes. sessions.list returns its data under frame.payload:
@@ -224,6 +227,35 @@ describe('gatewayHistoryToTranscript', () => {
   })
 })
 
+describe('gatewayAgentsToAgents', () => {
+  // agents.list returns { defaultId, mainKey, scope, agents:[{ id }] } (only id per agent).
+  it('maps an N-agent payload into Agent[] keyed on id (name) and passes mainKey through', () => {
+    const { agents, mainKey } = gatewayAgentsToAgents({
+      defaultId: 'main',
+      mainKey: 'main',
+      scope: 'per-sender',
+      agents: [{ id: 'main' }, { id: 'researcher' }],
+    })
+    expect(agents).toHaveLength(2)
+    expect(agents.map((a) => a.name)).toEqual(['main', 'researcher'])
+    expect(mainKey).toBe('main')
+  })
+
+  it('returns [] for an empty agents list (keeping mainKey when present)', () => {
+    expect(gatewayAgentsToAgents({ agents: [] })).toEqual({ agents: [], mainKey: undefined })
+    expect(gatewayAgentsToAgents({ mainKey: 'main', agents: [] })).toEqual({
+      agents: [],
+      mainKey: 'main',
+    })
+  })
+
+  it('tolerates malformed input instead of throwing', () => {
+    expect(gatewayAgentsToAgents(null)).toEqual({ agents: [], mainKey: undefined })
+    expect(gatewayAgentsToAgents({})).toEqual({ agents: [], mainKey: undefined })
+    expect(gatewayAgentsToAgents({ agents: 'nope' })).toEqual({ agents: [], mainKey: undefined })
+  })
+})
+
 describe('gatewayMessageToChatMessage', () => {
   it('maps a user history entry into the store ChatMessage shape', () => {
     const msg = gatewayMessageToChatMessage(
@@ -263,5 +295,47 @@ describe('gatewayMessageToChatMessage', () => {
       ),
     ).toBeNull()
     expect(gatewayMessageToChatMessage(null, 'agent_main', 0)).toBeNull()
+  })
+})
+
+describe('mergeHistoryWithPending', () => {
+  const historyMsg = (content: string, id: number): ChatMessage => ({
+    id,
+    conversation_id: 'agent:main:main',
+    from_agent: 'human',
+    to_agent: 'main',
+    content,
+    message_type: 'text',
+    created_at: 0,
+  })
+  const pending = (content: string, id: number, status: 'sending' | 'failed' | 'sent'): ChatMessage => ({
+    id,
+    conversation_id: 'agent:main:main',
+    from_agent: 'human',
+    to_agent: 'main',
+    content,
+    message_type: 'text',
+    created_at: 0,
+    pendingStatus: status,
+  })
+
+  it('returns history unchanged when there are no pending messages', () => {
+    const history = [historyMsg('hi', 1), historyMsg('there', 2)]
+    expect(mergeHistoryWithPending(history, [])).toEqual(history)
+  })
+
+  it('keeps a sending optimistic message whose content is not yet in history', () => {
+    const history = [historyMsg('earlier', 1)]
+    const current = [historyMsg('earlier', 1), pending('new turn', -1, 'sending')]
+    const merged = mergeHistoryWithPending(history, current)
+    expect(merged).toHaveLength(2)
+    expect(merged[merged.length - 1]).toMatchObject({ content: 'new turn', pendingStatus: 'sending' })
+  })
+
+  it('drops the optimistic message once history contains the same content', () => {
+    const history = [historyMsg('earlier', 1), historyMsg('new turn', 2)]
+    const current = [historyMsg('earlier', 1), pending('new turn', -1, 'sending')]
+    const merged = mergeHistoryWithPending(history, current)
+    expect(merged).toEqual(history)
   })
 })

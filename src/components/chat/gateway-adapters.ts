@@ -11,7 +11,7 @@
  *
  * Kept free of DOM/node imports so it can be unit-tested in isolation.
  */
-import type { Conversation, ChatMessage } from '@/store'
+import type { Conversation, ChatMessage, Agent } from '@/store'
 import type { SessionTranscriptMessage } from './session-message'
 
 export interface GatewaySession {
@@ -62,7 +62,7 @@ export function gatewayColorTag(key: string): (typeof TAG_COLOR_NAMES)[number] {
 }
 
 /** Extract the owning agent id from a gateway session key (`agent:<id>:<rest>`). */
-function agentFromKey(key: string): string | undefined {
+export function agentFromKey(key: string): string | undefined {
   const parts = key.split(':')
   if (parts[0] === 'agent' && parts[1]) return parts[1]
   return undefined
@@ -159,6 +159,52 @@ export function gatewaySessionsToConversations(
     .map((s) => gatewaySessionToConversation(s as GatewaySession, nowMs))
     .filter((c): c is Conversation => c !== null)
     .sort((a, b) => b.updatedAt - a.updatedAt)
+}
+
+/**
+ * Map the gateway `agents.list` result (`{ defaultId, mainKey, scope, agents:[{ id }] }`)
+ * into the existing UI `Agent[]` shape. Only `id` is present per agent, so the rest are
+ * minimal defaults. Tolerates malformed input (returns no agents). Scales to N agents.
+ */
+export function gatewayAgentsToAgents(
+  result: unknown,
+): { agents: Agent[]; mainKey: string | undefined } {
+  const mainKey =
+    isObject(result) && typeof result.mainKey === 'string' ? result.mainKey : undefined
+  const list = isObject(result) && Array.isArray(result.agents) ? result.agents : []
+  const agents = list
+    .map((entry, i): Agent | null => {
+      if (!isObject(entry) || typeof entry.id !== 'string') return null
+      return {
+        id: i + 1,
+        name: entry.id,
+        role: '',
+        status: 'idle',
+        created_at: 0,
+        updated_at: 0,
+      }
+    })
+    .filter((a): a is Agent => a !== null)
+  return { agents, mainKey }
+}
+
+/**
+ * Merge a freshly-mapped `chat.history` array with the current in-memory
+ * messages, preserving in-flight optimistic turns (negative-id `sending`/`failed`
+ * bubbles) that history has not echoed back yet. Once history contains the user's
+ * turn (same content), the optimistic copy drops naturally. Pure / unit-testable.
+ */
+export function mergeHistoryWithPending(
+  mappedHistory: ChatMessage[],
+  currentMessages: ChatMessage[],
+): ChatMessage[] {
+  const historyContents = new Set(mappedHistory.map((m) => m.content))
+  const pending = currentMessages.filter(
+    (m) =>
+      (m.pendingStatus === 'sending' || m.pendingStatus === 'failed') &&
+      !historyContents.has(m.content),
+  )
+  return [...mappedHistory, ...pending]
 }
 
 // --- transcript / message mapping ---------------------------------------------
