@@ -50,7 +50,6 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
   const { call, isConnected } = useWebSocket()
 
   const pendingIdRef = useRef(-1)
-  const mainKeyRef = useRef<string | undefined>(undefined)
   // Keep the latest messages in a ref so loadMessages' merge can read them
   // without re-creating the callback (which would restart the history poll).
   const chatMessagesRef = useRef(chatMessages)
@@ -101,8 +100,7 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
       if (!isConnected) return
       try {
         const result = await call('agents.list', {})
-        const { agents: mapped, mainKey } = gatewayAgentsToAgents(result)
-        mainKeyRef.current = mainKey
+        const { agents: mapped } = gatewayAgentsToAgents(result)
         setAgents(mapped)
       } catch (err) {
         // Graceful degradation: leave the agents list empty instead of
@@ -235,13 +233,13 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
   }, [activeConversation])
 
   const handleNewConversation = (agentName: string) => {
-    // Open the agent's primary session keyed `agent:<id>:<mainKey>`. Always use
-    // the raw gateway key (never a sessions.list row id): the key is stable so it
-    // reopens the same session's history, and it routes to the direct-agent chat
-    // view (MessageList + 10s chat.history poll + enabled composer) — a `session:`
-    // row id renders the un-polled transcript view instead. The same session may
-    // also appear as a list row; that is harmless.
-    const key = `agent:${agentName}:${mainKeyRef.current ?? 'main'}`
+    // Start a FRESH session with the agent: a unique key `agent:<id>:<new>` that
+    // the gateway auto-creates on the first send. Clicking an agent always opens a
+    // NEW chat (continue past sessions via the Recent list). The key routes to the
+    // direct-agent view (MessageList + 10s chat.history poll + enabled composer);
+    // chat.history is empty for the new key until the first turn lands.
+    const sessionId = `web-${Date.now().toString(36)}`
+    const key = `agent:${agentName}:${sessionId}`
     setActiveConversation(key)
     if (isMobile) setShowConversations(false)
   }
