@@ -7,6 +7,8 @@ import { Loader } from '@/components/ui/loader'
 import { useMissionControl, CronJob } from '@/store'
 import { createClientLogger } from '@/lib/client-logger'
 import { apiFetch, ApiError } from '@/lib/api-client'
+import { useWebSocket } from '@/lib/websocket'
+import { useSmartPoll } from '@/lib/use-smart-poll'
 const log = createClientLogger('CronManagement')
 import { buildDayKey, getCronOccurrences } from '@/lib/cron-occurrences'
 import { describeCronFrequency } from '@/lib/cron-utils'
@@ -119,10 +121,13 @@ function formatDateLabel(date: Date): string {
   return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
-export function CronManagementPanel() {
+export function CronManagementPanel({ podScoped = false }: { podScoped?: boolean } = {}) {
   const t = useTranslations('cronManagement')
   const { cronJobs, setCronJobs, dashboardMode } = useMissionControl()
   const isLocalMode = dashboardMode === 'local'
+  // ponytail: tenant-viewer mode reads the caller's own pod over the gateway WS
+  // (host /api/* 403s viewers). Renders read-only: job list + calendar only.
+  const { call, isConnected } = useWebSocket()
   const [isLoading, setIsLoading] = useState(false)
   const [showAddForm, setShowAddForm] = useState(false)
   const [selectedJob, setSelectedJob] = useState<CronJob | null>(null)
@@ -171,6 +176,22 @@ export function CronManagementPanel() {
   }
 
   const loadCronJobs = useCallback(async () => {
+    // ponytail: pod-scoped viewers read their own pod's cron over the gateway WS.
+    // Result is { jobs, ... } with the same CronJob[] shape; no host fetches.
+    if (podScoped) {
+      if (!isConnected) return
+      setIsLoading(true)
+      try {
+        const result = await call('cron.list')
+        setCronJobs(Array.isArray(result?.jobs) ? result.jobs : [])
+      } catch (error) {
+        log.error('Failed to load cron jobs:', error)
+      } finally {
+        setIsLoading(false)
+      }
+      return
+    }
+
     setIsLoading(true)
     try {
       const cronData = await apiFetch<{ jobs?: unknown }>('/api/cron?action=list')
@@ -204,13 +225,18 @@ export function CronManagementPanel() {
     } finally {
       setIsLoading(false)
     }
-  }, [isLocalMode, setCronJobs])
+  }, [isLocalMode, setCronJobs, podScoped, isConnected, call])
 
   useEffect(() => {
     loadCronJobs()
   }, [loadCronJobs])
 
+  // ponytail: keep the pod-scoped read-only list fresh via the WS poll.
+  useSmartPoll(loadCronJobs, 45000, { pauseWhenDisconnected: true, backoff: true, enabled: podScoped })
+
   useEffect(() => {
+    // ponytail: model discovery is a host-only fetch (403s viewers); skip it.
+    if (podScoped) return
     const loadAvailableModels = async () => {
       try {
         const data = await apiFetch<{ models?: unknown }>('/api/status?action=models')
@@ -224,7 +250,7 @@ export function CronManagementPanel() {
       }
     }
     loadAvailableModels()
-  }, [])
+  }, [podScoped])
 
   const validateForm = useCallback((form: NewJobForm): FormErrors => {
     const errors: FormErrors = {}
@@ -518,7 +544,8 @@ export function CronManagementPanel() {
 
   const handleJobSelect = (job: CronJob) => {
     setSelectedJob(job)
-    loadJobLogs(job)
+    // ponytail: log fetch is a host-only call (/api/cron?action=logs); skip it.
+    if (!podScoped) loadJobLogs(job)
   }
 
   const getStatusColor = (status?: string) => {
@@ -732,11 +759,13 @@ export function CronManagementPanel() {
             >
               {isLoading ? t('loading') : t('refresh')}
             </Button>
-            <Button
-              onClick={() => setShowAddForm(true)}
-            >
-              {t('addJob')}
-            </Button>
+            {!podScoped && (
+              <Button
+                onClick={() => setShowAddForm(true)}
+              >
+                {t('addJob')}
+              </Button>
+            )}
           </div>
         </div>
       </div>
@@ -1070,7 +1099,7 @@ export function CronManagementPanel() {
                     <th className="pb-2 pr-3 font-medium">{t('colStatus')}</th>
                     <th className="pb-2 pr-3 font-medium">{t('colLastRun')}</th>
                     <th className="pb-2 pr-3 font-medium">{t('colNextRun')}</th>
-                    <th className="pb-2 font-medium text-right">{t('colActions')}</th>
+                    {!podScoped && <th className="pb-2 font-medium text-right">{t('colActions')}</th>}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-border/50">
@@ -1122,6 +1151,7 @@ export function CronManagementPanel() {
                         <td className="py-2.5 pr-3 text-xs text-primary/70 whitespace-nowrap">
                           {job.nextRun ? formatRelativeTime(job.nextRun, true) : '--'}
                         </td>
+                        {!podScoped && (
                         <td className="py-2.5 text-right">
                           <div className="flex justify-end gap-1">
                             <Button
@@ -1188,6 +1218,7 @@ export function CronManagementPanel() {
                             </Button>
                           </div>
                         </td>
+                        )}
                       </tr>
                     )
                   })}
@@ -1282,6 +1313,7 @@ export function CronManagementPanel() {
                   </div>
                 </div>
 
+                {!podScoped && (
                 <div className="flex gap-2 flex-wrap">
                   <Button
                     onClick={() => triggerJob(selectedJob, 'force')}
@@ -1331,9 +1363,11 @@ export function CronManagementPanel() {
                     {t('remove')}
                   </Button>
                 </div>
+                )}
               </div>
 
-              {/* Right: Logs */}
+              {/* Right: Logs — host-only fetch; hidden in pod-scoped mode */}
+              {!podScoped && (
               <div>
                 <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">{t('recentLogs')}</h3>
                 <div className="bg-secondary/50 rounded-lg p-4 max-h-80 overflow-y-auto">
@@ -1351,13 +1385,14 @@ export function CronManagementPanel() {
                   )}
                 </div>
               </div>
+              )}
             </div>
           </div>
         )}
       </div>
 
-      {/* Run History Panel */}
-      {showRunHistory && selectedJob && (
+      {/* Run History Panel — host-only history fetch; hidden in pod-scoped mode */}
+      {!podScoped && showRunHistory && selectedJob && (
         <div className="bg-card border border-border rounded-lg p-6">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-xl font-semibold text-foreground">{t('runHistoryTitle', { name: selectedJob.name })}</h2>
@@ -1434,11 +1469,11 @@ export function CronManagementPanel() {
         </div>
       )}
 
-      {/* Claude Code Teams Overview */}
-      <ClaudeCodeTeamsSection />
+      {/* Claude Code Teams Overview — host-only /api/claude-tasks; hidden for viewers */}
+      {!podScoped && <ClaudeCodeTeamsSection />}
 
       {/* Add Job Modal */}
-      {showAddForm && (
+      {!podScoped && showAddForm && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-card border border-border rounded-lg p-6 w-full max-w-2xl m-4">
             <h2 className="text-xl font-semibold mb-4">{t('addNewCronJob')}</h2>

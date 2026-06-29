@@ -99,6 +99,12 @@ describe('k8s provisioning backend', () => {
     expect(instance).toContain('sandbox: { mode: "off" }') // object form, not `true`
     expect(instance).toMatch(/networkPolicy:\s*\n\s*enabled: false/) // delta-1
     expect(egress).toContain('port: 18032') // on-prem vLLM port
+    // wires a working vLLM provider (reasoning model needs the completions API)
+    expect(instance).toContain('primary: "vllm/GPT-OSS-120B"')
+    expect(instance).toMatch(/vllm:/)
+    expect(instance).toContain('api: "openai-completions"')
+    expect(instance).toContain('reasoning: true')
+    expect(instance).not.toContain('__OPENAI_BASE_URL__')
   })
 
   it('mapPhaseToStatus maps handled phases, and unknown/empty -> null', () => {

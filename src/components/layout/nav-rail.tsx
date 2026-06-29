@@ -5,6 +5,7 @@ import { useState, useEffect } from 'react'
 import { useTranslations } from 'next-intl'
 import { useMissionControl } from '@/store'
 import { useNavigateToPanel, usePrefetchPanel } from '@/lib/navigation'
+import { VIEWER_VISIBLE_PANELS } from '@/lib/viewer-panels'
 import { useRouter } from 'next/navigation'
 import { Button } from '@/components/ui/button'
 import { APP_VERSION } from '@/lib/version'
@@ -124,9 +125,9 @@ const gatewayOnlyPanels = new Set([
   'gateways', 'gateway-config', 'channels', 'nodes', 'exec-approvals',
   ...getPluginNavItems().filter(pi => pi.gatewayOnly).map(pi => pi.id),
 ])
-// PoC owner isolation: a non-admin (owner) sees ONLY their own instance panel —
-// every operator/host view is hidden. `my-instance` is hidden from admins (they
-// manage tenants from the admin views instead).
+// A non-admin (owner/viewer) sees only the pod-scoped panels in VIEWER_VISIBLE_PANELS —
+// each reads their own pod over the gateway. `my-instance` stays hidden from admins
+// (they manage tenants from the admin views).
 const OWNER_PANEL = 'my-instance'
 
 export function NavRail() {
@@ -188,8 +189,8 @@ export function NavRail() {
           return { ...i, children: filteredChildren }
         }
         if (isLocal && gatewayOnlyPanels.has(i.id)) return null
-        // Owner sees only their instance; admin sees everything except the owner panel.
-        if (!isAdmin && i.id !== OWNER_PANEL) return null
+        // Non-admins see only the curated pod-scoped allowlist.
+        if (!isAdmin && !VIEWER_VISIBLE_PANELS.has(i.id)) return null
         if (isAdmin && i.id === OWNER_PANEL) return null
         if (isEssential && !i.essential) return null
         return i

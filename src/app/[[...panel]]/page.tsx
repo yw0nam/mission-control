@@ -40,7 +40,11 @@ import { ExecApprovalPanel } from '@/components/panels/exec-approval-panel'
 import { SystemMonitorPanel } from '@/components/panels/system-monitor-panel'
 import { ChatPagePanel } from '@/components/panels/chat-page-panel'
 import { ChatPanel } from '@/components/chat/chat-panel'
-import { STORAGE_GATEWAY_URL } from '@/lib/device-identity'
+import { PodOverviewPanel } from '@/components/panels/pod-overview-panel'
+import { PodHealthPanel } from '@/components/panels/pod-health-panel'
+import { PodConfigPanel } from '@/components/panels/pod-config-panel'
+import { PodAgentRosterPanel } from '@/components/panels/pod-agent-roster-panel'
+import { VIEWER_VISIBLE_PANELS } from '@/lib/viewer-panels'
 import { getPluginPanel } from '@/lib/plugins'
 import { shouldRedirectDashboardToHttps } from '@/lib/browser-security'
 import { useTranslations } from 'next-intl'
@@ -187,20 +191,11 @@ export default function Home() {
       return
     }
 
-    const connectWithEnvFallback = (localGatewayUrl: string | null) => {
-      // localStorage user choice takes priority over env vars
-      const explicitWsUrl = localGatewayUrl || process.env.NEXT_PUBLIC_GATEWAY_URL || ''
-      if (explicitWsUrl) {
-        connect(explicitWsUrl)
-        return
-      }
-      const gatewayPort = process.env.NEXT_PUBLIC_GATEWAY_PORT || '18789'
-      const gatewayHost = process.env.NEXT_PUBLIC_GATEWAY_HOST || window.location.hostname
-      const gatewayProto =
-        process.env.NEXT_PUBLIC_GATEWAY_PROTOCOL ||
-        (window.location.protocol === 'https:' ? 'wss' : 'ws')
-      const wsUrl = `${gatewayProto}://${gatewayHost}:${gatewayPort}`
-      connect(wsUrl)
+    // Connect to the same-origin broker bridge for ALL roles. No token: the broker
+    // performs the gateway handshake server-side with a per-tenant token the browser
+    // never sees (admins routed to the host gateway, viewers to their own pod).
+    const connectToBroker = () => {
+      connect(`${window.location.origin.replace(/^http/, 'ws')}/ws/gateway`)
     }
 
     const connectWithPrimaryGateway = async (preferredWsUrl?: string | null): Promise<{ attempted: boolean; connected: boolean }> => {
@@ -303,9 +298,7 @@ export default function Home() {
         if (err instanceof ApiError && err.code !== 'NETWORK_ERROR') return null
         throw err
       })
-      .then(async data => {
-        const localGatewayUrl = localStorage.getItem(STORAGE_GATEWAY_URL)
-
+      .then(data => {
         if (data?.subscription) {
           setSubscription(data.subscription)
         }
@@ -316,36 +309,14 @@ export default function Home() {
           setInterfaceMode(data.interfaceMode)
         }
 
-        // User's explicit gateway URL choice (localStorage) takes PRIORITY over server's gateway flag.
-        // If user chose a URL from login page, always connect to it.
-        if (localGatewayUrl) {
-          // User explicitly chose a gateway URL — always set full mode
-          setDashboardMode('full')
-          setGatewayAvailable(true)
-          if (data?.claudeHome) {
-            setLocalSessionsAvailable(true)
-          }
-          setCapabilitiesChecked(true)
-          markStep('capabilities')
-          const primaryConnect = await connectWithPrimaryGateway(localGatewayUrl)
-          if (!primaryConnect.connected) {
-            connect(localGatewayUrl)
-          }
-          markStep('connect')
-          return
-        }
-
-        // No user-chosen URL — use server's gateway flag to decide
+        // `data.gateway` is the HOST capabilities flag (local-mode UI semantics for an
+        // admin on a gateway-less host). It does NOT govern viewers: a viewer's own pod
+        // gateway is reachable via the broker regardless. So we record the host flag for
+        // UI that needs it, but always connect below.
         if (data && data.gateway === false) {
           setDashboardMode('local')
           setGatewayAvailable(false)
-          setCapabilitiesChecked(true)
-          markStep('capabilities')
-          markStep('connect')
-          // Skip WebSocket connect — no gateway to talk to
-          return
-        }
-        if (data && data.gateway === true) {
+        } else if (data && data.gateway === true) {
           setDashboardMode('full')
           setGatewayAvailable(true)
         }
@@ -355,11 +326,10 @@ export default function Home() {
         setCapabilitiesChecked(true)
         markStep('capabilities')
 
-        // No user choice + server gateway flag false → try primary gateway / env fallback
-        const primaryConnect = await connectWithPrimaryGateway()
-        if (!primaryConnect.connected && !primaryConnect.attempted) {
-          connectWithEnvFallback(null)
-        }
+        // Always connect to the same-origin broker for an authenticated user, every role.
+        // Chat/pod UI gates on the live /ws/gateway socket (useWebSocket().isConnected),
+        // which reflects the viewer's own pod connection — not the host capabilities flag.
+        connectToBroker()
         markStep('connect')
       })
       .catch(() => {
@@ -367,7 +337,7 @@ export default function Home() {
         setCapabilitiesChecked(true)
         markStep('capabilities')
         markStep('connect')
-        connectWithEnvFallback(null)
+        connectToBroker()
       })
 
     // Check onboarding state.
@@ -526,11 +496,12 @@ function ContentRouter({ tab }: { tab: string }) {
   const { dashboardMode, interfaceMode, setInterfaceMode, currentUser } = useMissionControl()
   const navigateToPanel = useNavigateToPanel()
   const isLocal = dashboardMode === 'local'
+  const isAdmin = currentUser?.role === 'admin'
   const panelName = tab.replace(/-/g, ' ')
 
-  // PoC owner isolation: a non-admin (owner) only ever renders their own instance,
-  // regardless of the URL — they cannot reach operator/host panels through the UI.
-  if (currentUser && currentUser.role !== 'admin' && tab !== 'my-instance') {
+  // Non-admins are scoped to their own pod: only the curated pod-backed panels are
+  // reachable; a deep-link to anything else bounces to their instance view.
+  if (currentUser && !isAdmin && !VIEWER_VISIBLE_PANELS.has(tab)) {
     return <MyInstancePanel />
   }
 
@@ -568,6 +539,7 @@ function ContentRouter({ tab }: { tab: string }) {
     case 'my-instance':
       return <MyInstancePanel />
     case 'overview':
+      if (!isAdmin) return <PodOverviewPanel />
       return (
         <>
           <Dashboard />
@@ -581,6 +553,7 @@ function ContentRouter({ tab }: { tab: string }) {
     case 'tasks':
       return <TaskBoardPanel />
     case 'agents':
+      if (!isAdmin) return <PodAgentRosterPanel />
       return (
         <>
           <OrchestrationBar />
@@ -595,15 +568,15 @@ function ContentRouter({ tab }: { tab: string }) {
     case 'sessions':
       return <ChatPagePanel />
     case 'logs':
-      return <LogViewerPanel />
+      return <LogViewerPanel podScoped={!isAdmin} />
     case 'cron':
-      return <CronManagementPanel />
+      return <CronManagementPanel podScoped={!isAdmin} />
     case 'memory':
       return <MemoryBrowserPanel />
     case 'cost-tracker':
     case 'tokens':
     case 'agent-costs':
-      return <CostTrackerPanel />
+      return <CostTrackerPanel podScoped={!isAdmin} />
     case 'users':
       return <UserManagementPanel />
     case 'history':
@@ -624,6 +597,7 @@ function ContentRouter({ tab }: { tab: string }) {
     case 'integrations':
       return <IntegrationsPanel />
     case 'settings':
+      if (!isAdmin) return <PodConfigPanel />
       return <SettingsPanel />
     case 'super-admin':
       return <SuperAdminPanel />
@@ -632,12 +606,13 @@ function ContentRouter({ tab }: { tab: string }) {
     case 'office':
       return <OfficePanel />
     case 'monitor':
+      if (!isAdmin) return <PodHealthPanel />
       return <SystemMonitorPanel />
     case 'skills':
-      return <SkillsPanel />
+      return <SkillsPanel podScoped={!isAdmin} />
     case 'channels':
       if (isLocal) return <LocalModeUnavailable panel={tab} />
-      return <ChannelsPanel />
+      return <ChannelsPanel podScoped={!isAdmin} />
     case 'nodes':
       if (isLocal) return <LocalModeUnavailable panel={tab} />
       return <NodesPanel />
