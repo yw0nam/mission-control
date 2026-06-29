@@ -2,9 +2,18 @@ import { randomUUID } from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import { getDatabase, appendProvisionEvent, logAuditEvent, Tenant, ProvisionJob } from './db'
+import { getUserById } from './auth'
 import { runCommand } from './command'
 import { runProvisionerCommand } from './provisioner-client'
 import { config as appConfig } from './config'
+import {
+  provisionerBackend,
+  ensureK8sArtifacts,
+  buildK8sBootstrapPlan,
+  buildK8sDecommissionPlan,
+  buildK8sSuspendPlan,
+  buildK8sResumePlan,
+} from './super-admin-k8s'
 
 export type TenantStatus = 'pending' | 'provisioning' | 'decommissioning' | 'active' | 'suspended' | 'error'
 export type ProvisionJobStatus = 'queued' | 'approved' | 'running' | 'completed' | 'failed' | 'rejected' | 'cancelled'
@@ -20,6 +29,7 @@ export interface TenantBootstrapRequest {
   dry_run?: boolean
   config?: Record<string, any>
   owner_gateway?: string
+  owner_user_id?: number
 }
 
 export interface TenantDecommissionRequest {
@@ -54,7 +64,7 @@ function normalizeSlug(input: string): string {
   return (input || '').trim().toLowerCase()
 }
 
-function isValidSlug(slug: string): boolean {
+export function isValidSlug(slug: string): boolean {
   return /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/.test(slug)
 }
 
@@ -248,6 +258,13 @@ function getProvisionArtifactDir(slug: string) {
 function ensureProvisionArtifacts(job: any) {
   const requestJson = parseJobRequest(job) as any
   const slug = String(requestJson?.slug || job?.tenant_slug || '').trim()
+
+  if (String(requestJson?.backend || '') === 'k8s') {
+    if (!slug) throw new Error('Missing tenant slug for artifact generation')
+    ensureK8sArtifacts(slug)
+    return
+  }
+
   const linuxUser = String(job?.linux_user || '').trim()
   const openclawHome = String(job?.openclaw_home || '').trim()
   const gatewayPort = Number(requestJson?.gateway_port ?? job?.gateway_port ?? 0)
@@ -350,12 +367,119 @@ export function getProvisionJob(jobId: number) {
   }
 }
 
+/**
+ * Returns the single instance owned by a 일반사용자(owner), or null if none.
+ * Most-recently-created wins if (unexpectedly) more than one is bound.
+ */
+export function getTenantForOwner(userId: number): Tenant | null {
+  const db = getDatabase()
+  const row = db.prepare(`
+    SELECT * FROM tenants WHERE owner_user_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
+  `).get(userId) as Tenant | undefined
+  if (!row) return null
+  return { ...row, config: parseJsonField(row.config, {}) as any }
+}
+
+/**
+ * Persists a new lifecycle status on a tenant. Used by status projection so a read
+ * path can reconcile the DB with the live operator phase. Mirrors the inline UPDATE
+ * used by executeProvisionJob.
+ */
+export function updateTenantStatus(
+  tenantId: number,
+  status: Tenant['status'],
+  expected?: Tenant['status'],
+): void {
+  const db = getDatabase()
+  // When `expected` is supplied the UPDATE is conditional on the current value,
+  // closing the lost-update window between the projection read and this write.
+  const result = expected !== undefined
+    ? db.prepare(`
+        UPDATE tenants
+        SET status = ?, updated_at = (unixepoch())
+        WHERE id = ? AND status = ?
+      `).run(status, tenantId, expected)
+    : db.prepare(`
+        UPDATE tenants
+        SET status = ?, updated_at = (unixepoch())
+        WHERE id = ?
+      `).run(status, tenantId)
+
+  // Only audit a real transition (conditional UPDATE may have matched no row).
+  if (result.changes > 0) {
+    logAuditEvent({
+      action: 'tenant_status_projected',
+      actor: 'system:projection',
+      target_type: 'tenant',
+      target_id: tenantId,
+      detail: { from: expected ?? null, to: status },
+    })
+  }
+}
+
+/** Stamp the last time MC brokered a gateway connection for this tenant (idle clock). */
+export function markTenantActive(tenantId: number): void {
+  const db = getDatabase()
+  db.prepare(`UPDATE tenants SET last_active_at = (unixepoch()) WHERE id = ?`).run(tenantId)
+}
+
+// Idle auto-suspend lives in the operator (openclaw-operator), not here. Mission
+// Control is the end-user UI: it only *reports* activity to the cluster
+// (stampLastActive writes the openclaw.rocks/last-active annotation on each brokered
+// browser->pod frame). The operator owns the idle decision and the suspend action in
+// its reconcile loop. Keeping the sweep out of the UI avoids two writers racing on
+// the same CR.
+
+/**
+ * Owner self-service suspend/resume. EXEMPT from the two-person rule (reversible,
+ * low-risk): the owner both requests, approves, and runs the live job.
+ * The execution path relaxes the two-person checks for suspend/resume job types.
+ */
+export async function runSelfServiceLifecycle(
+  user: { id: number; username: string },
+  kind: 'suspend' | 'resume'
+) {
+  if (!Number.isInteger(user.id) || user.id <= 0) {
+    throw new Error('Self-service is only available to interactive users')
+  }
+
+  const tenant = getTenantForOwner(user.id)
+  if (!tenant) throw new Error('No instance assigned to this user')
+
+  const actor = `user:${user.username}`
+  const { job } = createTenantLifecycleJob(tenant.id, kind, { dry_run: false }, actor)
+  if (!job) throw new Error('Failed to create lifecycle job')
+
+  transitionProvisionJobStatus(job.id, actor, 'approve')
+  await executeProvisionJob(job.id, actor)
+
+  // Re-read post-execution so status reflects the final value, and return only a
+  // minimal owner-facing shape (no kubectl commands, stdout/stderr, runner_host,
+  // on-disk paths, linux_user, ports, plan_json, etc.).
+  const freshTenant = getTenantForOwner(user.id) ?? tenant
+  const finalJob = getProvisionJob(job.id)
+
+  return {
+    instance: {
+      slug: freshTenant.slug,
+      display_name: freshTenant.display_name,
+      status: freshTenant.status,
+      plan_tier: freshTenant.plan_tier,
+    },
+    job: { id: job.id, status: finalJob?.status ?? null },
+  }
+}
+
 export function createTenantAndBootstrapJob(request: TenantBootstrapRequest, actor: string) {
   const db = getDatabase()
 
+  const backend = provisionerBackend()
+
+  // systemd backend seeds tenants from an openclaw.json + a gateway unit template.
+  // The k8s backend renders manifests at run time (see super-admin-k8s.ts) and needs neither.
   const templateOpenclawJsonPath =
     String(process.env.MC_SUPER_TEMPLATE_OPENCLAW_JSON || (process.env.OPENCLAW_HOME ? path.join(process.env.OPENCLAW_HOME, 'openclaw.json') : '')).trim()
-  if (!templateOpenclawJsonPath) {
+  if (backend === 'systemd' && !templateOpenclawJsonPath) {
     throw new Error('Missing OpenClaw template config. Set MC_SUPER_TEMPLATE_OPENCLAW_JSON to an openclaw.json to seed new tenants.')
   }
 
@@ -384,7 +508,12 @@ export function createTenantAndBootstrapJob(request: TenantBootstrapRequest, act
   const dryRun = request.dry_run !== false
   const ownerGateway = normalizeOwnerGateway((request as any).owner_gateway, slug)
 
-  if (!gatewayPort) {
+  const ownerUserId = request.owner_user_id ?? null
+  if (ownerUserId != null && !getUserById(ownerUserId)) {
+    throw new Error('owner_user_id does not reference an existing user')
+  }
+
+  if (backend === 'systemd' && !gatewayPort) {
     throw new Error('gateway_port is required for tenant bootstrap')
   }
 
@@ -395,8 +524,8 @@ export function createTenantAndBootstrapJob(request: TenantBootstrapRequest, act
 
   const inserted = db.transaction(() => {
     const tenantRes = db.prepare(`
-      INSERT INTO tenants (slug, display_name, linux_user, plan_tier, status, openclaw_home, workspace_root, gateway_port, dashboard_port, config, created_by, owner_gateway)
-      VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tenants (slug, display_name, linux_user, plan_tier, status, openclaw_home, workspace_root, gateway_port, dashboard_port, config, created_by, owner_gateway, owner_user_id)
+      VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       slug,
       displayName,
@@ -408,24 +537,28 @@ export function createTenantAndBootstrapJob(request: TenantBootstrapRequest, act
       dashboardPort,
       JSON.stringify(config),
       actor,
-      ownerGateway
+      ownerGateway,
+      ownerUserId
     )
 
     const tenantId = Number(tenantRes.lastInsertRowid)
 
-    const plan = buildBootstrapPlan({
-      slug,
-      linux_user: linuxUser,
-      openclaw_home: openclawHome,
-      workspace_root: workspaceRoot,
-      gateway_port: gatewayPort,
-      dashboard_port: dashboardPort,
-    }, {
-      templateOpenclawJsonPath,
-      gatewaySystemdTemplatePath,
-    })
+    const plan = backend === 'k8s'
+      ? buildK8sBootstrapPlan(slug)
+      : buildBootstrapPlan({
+          slug,
+          linux_user: linuxUser,
+          openclaw_home: openclawHome,
+          workspace_root: workspaceRoot,
+          gateway_port: gatewayPort,
+          dashboard_port: dashboardPort,
+        }, {
+          templateOpenclawJsonPath,
+          gatewaySystemdTemplatePath,
+        })
 
     const requestPayload = {
+      backend,
       slug,
       display_name: displayName,
       linux_user: linuxUser,
@@ -435,6 +568,7 @@ export function createTenantAndBootstrapJob(request: TenantBootstrapRequest, act
       dry_run: dryRun,
       config,
       owner_gateway: ownerGateway,
+      owner_user_id: ownerUserId,
     }
 
     const jobRes = db.prepare(`
@@ -497,17 +631,21 @@ export function createTenantDecommissionJob(tenantId: number, request: TenantDec
   const removeStateDirs = !!request.remove_state_dirs
   const reason = String(request.reason || '').trim()
 
-  const plan = buildDecommissionPlan({
-    slug: tenant.slug,
-    linux_user: tenant.linux_user,
-    openclaw_home: tenant.openclaw_home,
-    workspace_root: tenant.workspace_root,
-  }, {
-    remove_linux_user: removeLinuxUser,
-    remove_state_dirs: removeStateDirs,
-  })
+  const backend = provisionerBackend()
+  const plan = backend === 'k8s'
+    ? buildK8sDecommissionPlan(tenant.slug)
+    : buildDecommissionPlan({
+        slug: tenant.slug,
+        linux_user: tenant.linux_user,
+        openclaw_home: tenant.openclaw_home,
+        workspace_root: tenant.workspace_root,
+      }, {
+        remove_linux_user: removeLinuxUser,
+        remove_state_dirs: removeStateDirs,
+      })
 
   const requestPayload = {
+    backend,
     tenant_id: tenant.id,
     slug: tenant.slug,
     linux_user: tenant.linux_user,
@@ -545,6 +683,81 @@ export function createTenantDecommissionJob(tenantId: number, request: TenantDec
     target_type: 'tenant',
     target_id: tenant.id,
     detail: { job_id: jobId, dry_run: dryRun, remove_linux_user: removeLinuxUser, remove_state_dirs: removeStateDirs },
+  })
+
+  return { tenant, job: getProvisionJob(jobId) }
+}
+
+/**
+ * Suspend (scale-to-zero) or resume a tenant. k8s backend only — maps to the
+ * PoC's `spec.suspended` toggle (observation #3: ~10s to release CPU/mem, slow wake).
+ */
+export function createTenantLifecycleJob(
+  tenantId: number,
+  kind: 'suspend' | 'resume',
+  request: { dry_run?: boolean; reason?: string },
+  actor: string
+) {
+  if (provisionerBackend() !== 'k8s') {
+    throw new Error(`${kind} is only supported on the k8s provisioner backend`)
+  }
+
+  const db = getDatabase()
+  if (!Number.isInteger(tenantId) || tenantId <= 0) throw new Error('Invalid tenant id')
+
+  const tenant = db.prepare('SELECT * FROM tenants WHERE id = ?').get(tenantId) as Tenant | undefined
+  if (!tenant) throw new Error('Tenant not found')
+
+  if (kind === 'suspend' && tenant.status !== 'active') {
+    throw new Error(`Cannot suspend an instance in status '${tenant.status}'`)
+  }
+  if (kind === 'resume' && tenant.status !== 'suspended') {
+    throw new Error(`Cannot resume an instance in status '${tenant.status}'`)
+  }
+
+  const dryRun = request.dry_run !== false
+  const reason = String(request.reason || '').trim()
+  const plan = kind === 'suspend'
+    ? buildK8sSuspendPlan(tenant.slug)
+    : buildK8sResumePlan(tenant.slug)
+
+  const requestPayload = {
+    backend: 'k8s',
+    tenant_id: tenant.id,
+    slug: tenant.slug,
+    dry_run: dryRun,
+    reason: reason || null,
+  }
+
+  const jobRes = db.prepare(`
+    INSERT INTO provision_jobs (tenant_id, job_type, status, dry_run, requested_by, idempotency_key, request_json, plan_json, updated_at)
+    VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, (unixepoch()))
+  `).run(
+    tenant.id,
+    kind,
+    dryRun ? 1 : 0,
+    actor,
+    randomUUID(),
+    JSON.stringify(requestPayload),
+    JSON.stringify(plan),
+  )
+
+  const jobId = Number(jobRes.lastInsertRowid)
+
+  appendProvisionEvent({
+    job_id: jobId,
+    level: 'info',
+    step_key: 'queued',
+    message: `${kind} request queued (${dryRun ? 'dry-run' : 'execute'})`,
+    data: { actor, reason: reason || null },
+  })
+
+  logAuditEvent({
+    action: `tenant_${kind}_requested`,
+    actor,
+    target_type: 'tenant',
+    target_id: tenant.id,
+    detail: { job_id: jobId, dry_run: dryRun },
   })
 
   return { tenant, job: getProvisionJob(jobId) }
@@ -721,7 +934,8 @@ export async function executeProvisionJob(jobId: number, actor: string) {
     throw new Error('Missing approver. Approve the job before run.')
   }
 
-  if (!dryRun) {
+  const isSelfServiceLifecycle = jobType === 'suspend' || jobType === 'resume'
+  if (!dryRun && !isSelfServiceLifecycle) {
     if (approvedBy === requestedBy) {
       throw new Error('Two-person rule violation: live jobs require an approver different from the requester.')
     }
@@ -818,9 +1032,12 @@ export async function executeProvisionJob(jobId: number, actor: string) {
     )
 
     const completedTenantStatus = (() => {
-      if (jobType === 'decommission') {
-        return dryRun ? previousTenantStatus : 'suspended'
+      // Dry-run never mutates real state.
+      if (dryRun && (jobType === 'decommission' || jobType === 'suspend' || jobType === 'resume')) {
+        return previousTenantStatus
       }
+      if (jobType === 'decommission' || jobType === 'suspend') return 'suspended'
+      if (jobType === 'resume') return 'active'
       // For bootstrap/update jobs, mark tenant active when the workflow completes,
       // even in dry-run mode, so workspace lifecycle is not stuck in pending.
       return 'active'
@@ -831,6 +1048,13 @@ export async function executeProvisionJob(jobId: number, actor: string) {
       WHERE id = ?
     `).run(completedTenantStatus, job.tenant_id)
 
+    // A live decommission deletes the k8s namespace; the instance is gone. Detach it
+    // from its former owner so getTenantForOwner stops resolving a dead instance
+    // (otherwise the ex-owner could self-service resume a deleted namespace).
+    if (!dryRun && jobType === 'decommission') {
+      db.prepare(`UPDATE tenants SET owner_user_id = NULL WHERE id = ?`).run(job.tenant_id)
+    }
+
     appendProvisionEvent({
       job_id: jobId,
       level: 'info',
@@ -839,7 +1063,7 @@ export async function executeProvisionJob(jobId: number, actor: string) {
     })
 
     logAuditEvent({
-      action: 'tenant_bootstrap_completed',
+      action: `tenant_${jobType}_completed`,
       actor,
       target_type: 'tenant',
       target_id: job.tenant_id,
@@ -872,7 +1096,7 @@ export async function executeProvisionJob(jobId: number, actor: string) {
     })
 
     logAuditEvent({
-      action: 'tenant_bootstrap_failed',
+      action: `tenant_${jobType}_failed`,
       actor,
       target_type: 'tenant',
       target_id: job.tenant_id,

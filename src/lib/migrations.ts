@@ -1428,6 +1428,24 @@ const migrations: Migration[] = [
       db.exec(`ALTER TABLE mcp_call_log ADD COLUMN signature TEXT DEFAULT NULL`)
       db.exec(`ALTER TABLE mcp_call_log ADD COLUMN public_key TEXT DEFAULT NULL`)
     }
+  },
+  {
+    id: '051_tenant_owner',
+    up(db: Database.Database) {
+      // Bind a tenant (provisioned OpenClaw instance) to an owning user so that
+      // 일반사용자(owner) can view and self-service-manage only their own instance.
+      db.exec(`ALTER TABLE tenants ADD COLUMN owner_user_id INTEGER REFERENCES users(id)`)
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_tenants_owner_user_id ON tenants(owner_user_id)`)
+    }
+  },
+  {
+    id: '052_tenant_activity',
+    up(db: Database.Database) {
+      // Last time MC brokered a gateway connection for this tenant. Informational,
+      // surfaced in the owner-facing /api/me/usage view. (Idle auto-suspend is owned
+      // by the operator, which reads the openclaw.rocks/last-active CR annotation.)
+      db.exec(`ALTER TABLE tenants ADD COLUMN last_active_at INTEGER DEFAULT NULL`)
+    }
   }
 ]
 
