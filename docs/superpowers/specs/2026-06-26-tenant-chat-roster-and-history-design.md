@@ -43,10 +43,12 @@ gateway-behavior facts are empirical probes)
   `OPENAI_BASE_URL` via `spec.env`/`envFrom` and force-protects `gateway.*` (`configmap.go`,
   `docs/custom-providers.md`). → The §4b "make it demonstrable" knob and the §6 reasoning-only fix
   are **CR `spec.config.raw` changes (operator/CR touch, outside MC)**, not a vLLM request param.
-- **`last-active` is stamped by the MC broker on EVERY browser→pod frame** (operator
-  `internal/controller/idlesuspend.go` reads the annotation; MC `reportActivity` writes it). So a 10s
-  `chat.history` poll DOES bump last-active → a left-open chat panel keeps the pod awake until the tab
-  is hidden (when `useSmartPoll` pauses). Accept for P1; tab-hidden pause is the mitigation (§4a).
+- **`last-active` is stamped by the MC broker on browser→pod frames, THROTTLED to ~1/60s**
+  (`gateway-proxy-ws.ts:33` `STAMP_THROTTLE_MS=60_000`; operator `idlesuspend.go` reads the
+  annotation). So a 10s `chat.history` poll re-stamps at the **60s cadence, not the 10s poll cadence** —
+  a left-open chat panel holds the pod awake (at ~1 stamp/min) until the tab is hidden (when
+  `useSmartPoll` pauses). The cost is real but smaller than "every frame"; accept for P1 (tab-hidden
+  pause is the mitigation, §4a).
 
 ### 2c. Provisioning prerequisite (operator/CR, NOT MC) — root cause of "no replies"
 The earlier "send works but no reply ever appears" symptom was **not** an MC or openclaw limitation:
@@ -82,7 +84,9 @@ Keep the agent-picker UX (OpenClaw is multi-agent; one agent today, wiring must 
   (`gateway-adapters.ts:65`).
 - Display: header/status do `.replace('agent_', '')` (~:406-414, ~:902-914) — map the active gateway
   key back through `agentFromKey()` for the agent name, else the header literally shows
-  `agent:main:main`.
+  `agent:main:main`. **Source the key from `selectedConversation.session.sessionKey`** (already
+  populated, `gateway-adapters.ts:124`), **not** from `activeConversation` — for a `sessions.list` row
+  the active id is `session:gateway:<sessionId>`, and `agentFromKey('session:gateway:…')` → undefined.
 
 ### 3b. Adapter (pure, TDD)
 Add `gatewayAgentsToAgents(result)` to `gateway-adapters.ts`, mirroring the existing tolerant pure
@@ -90,7 +94,9 @@ pattern (returns `[]` on junk). Maps the **full `agents[]` array** → UI `Agent
 - `name = agent.id`; `id` (numeric, required) = array index + 1 (stable identity is all it needs —
   `renderAgentItem` keys on `name`); `role = ''`; `created_at`/`updated_at` = 0; **`status = 'idle'`**
   (see §3d). Return `mainKey`/`defaultId` to the caller **separately** (not threaded into each
-  `Agent`) for §3c key-building.
+  `Agent`) for §3c key-building. **Return a plain object literal `{ agents, mainKey }`** — do **not**
+  introduce a `GatewayAgentsResult` interface/type (mirror the existing `gatewaySessionsToConversations`
+  which just returns an array).
 - Unit test includes a **synthetic 2-agent fixture** to prove the "scales to N" claim, plus
   empty/malformed cases.
 
@@ -101,7 +107,8 @@ gateway key so `chat.send`/`chat.history` (which key on `sessionKey`) work. **Re
 (review A3/C1):** if `conversations` already has a row whose `session.sessionKey` equals that key
 (from `sessions.list`, whose row `id` is `session:gateway:<sessionId>`), select **that existing row**
 instead of the raw key — avoids a phantom duplicate entry. Otherwise use the raw key (session is
-auto-created on first send).
+auto-created on first send). **Keep this to one `conversations.find(c => c.session?.sessionKey === key)`
+with a raw-key fallback — no key-normalization helper, no lookup map.**
 **New-conversation UX (user-confirmed 2026-06-29):** keep MC's existing agent-picker click behavior —
 clicking agent `X` **reopens its existing session if one exists, otherwise opens a new session** (the
 raw key auto-creates on first send). This is exactly the reconcile above; no forking of a second
@@ -113,6 +120,10 @@ session), but it is **deliberately not exposed** in P1 — kept out of scope wit
 filters at `chat-workspace.tsx:338` and `conversation-list.tsx:246` test `idle|busy`, so `'idle'`
 reads correctly as "online, not busy" with zero consumer edits). This is the laziest correct value;
 do not invent `busy`. "N online" then = count of reachable agents while the pod is connected.
+- **Dot color — verify at implementation (reviewers disagreed):** `STATUS_COLORS.idle` is yellow
+  (`conversation-list.tsx:38`), but `renderAgentItem` (~:260) may render its own green `online` dot
+  instead of using `STATUS_COLORS`. Either reads as "online, not busy" — just confirm which path the
+  agent rows take so the dot color is intentional, not a surprise. No code change implied by §3d itself.
 
 ## 4. Item 1 — Reply delivery via history pull (single source of truth)
 
@@ -124,6 +135,12 @@ expected to watch replies live.
   interval while a session is open, via the existing `useSmartPoll` with **`pauseWhenDisconnected:
   true, backoff: true`** (do **not** pass `pauseWhenSseConnected` — the poll must run while the WS is
   up). `useSmartPoll` already pauses when the tab is hidden.
+- **Why always-on (not run-gated):** a leaner option is to poll only while a run is in-flight
+  (`isGenerating` or a `sending` optimistic message) and otherwise fetch-on-focus — this removes most
+  of the §2b pod-awake cost. We **reject it for P1** because a reply can land *after* the user
+  navigates away and back (the whole point of history-as-source-of-truth, §4), and run-gating adds
+  start/stop state for a poll that is already cheap (one read every 10s, stamped only ~1/60s). Revisit
+  if pod-awake cost proves material; the swap is a one-line guard on the `useSmartPoll` enable flag.
 - **Do NOT wire or depend on the `chat.message` WS event for replies.** Leave the handler
   (`websocket.ts:612-627`) untouched for other consumers, but it is not a reply source here. (Three
   id spaces — optimistic negative ids, WS server ids, history `timestamp+index` ids — never
@@ -155,7 +172,10 @@ Split so the MC change is verifiable independent of the model:
   `gatewayAgentsToAgents` (+ 2-agent fixture, key/display via existing `agentFromKey`).
 - `src/components/chat/chat-workspace.tsx` — `loadAgents()`→gateway; `handleNewConversation` key
   mapping + identity reconcile; remove orphan `agent_` branches; header/status via `agentFromKey`;
-  add the 10s `chat.history` poll with the merge contract.
+  add the 10s `chat.history` poll with the merge contract. **Factor the merge as a pure helper**
+  (`mappedHistory + optimistic-not-yet-in-history`) so it is unit-testable in isolation — this is the
+  subtle logic (the negative/positive/`tsMs+index` id spaces never reconcile via `addChatMessage`'s
+  positive-id-only dedup, `store/index.ts`), the kind that regresses silently.
 - `src/components/chat/conversation-list.tsx` — agent rows from gateway roster; `renderAgentItem`
   status read works as-is given §3d (`status:'idle'`).
 - No backend/broker/auth/websocket.ts changes.
@@ -178,4 +198,5 @@ Split so the MC change is verifiable independent of the model:
 3b. **(validated §2d)** The live GPT-OSS agent emits a visible `thinking|text` turn (provider wired,
    §2c); for other pods this is the §2c provisioning prerequisite, not an MC criterion.
 4. `gatewayAgentsToAgents` and the agent→session-key mapping are unit-tested (TDD), incl. 2-agent.
+   The pure merge helper (§5: history + optimistic-not-in-history) has its own unit test.
 5. No regression in committed P1 paths (sessions list, history load, send); no `chat.message` wiring.
