@@ -40,6 +40,11 @@ import { ExecApprovalPanel } from '@/components/panels/exec-approval-panel'
 import { SystemMonitorPanel } from '@/components/panels/system-monitor-panel'
 import { ChatPagePanel } from '@/components/panels/chat-page-panel'
 import { ChatPanel } from '@/components/chat/chat-panel'
+import { PodOverviewPanel } from '@/components/panels/pod-overview-panel'
+import { PodHealthPanel } from '@/components/panels/pod-health-panel'
+import { PodConfigPanel } from '@/components/panels/pod-config-panel'
+import { PodAgentRosterPanel } from '@/components/panels/pod-agent-roster-panel'
+import { VIEWER_VISIBLE_PANELS } from '@/lib/viewer-panels'
 import { getPluginPanel } from '@/lib/plugins'
 import { shouldRedirectDashboardToHttps } from '@/lib/browser-security'
 import { useTranslations } from 'next-intl'
@@ -486,20 +491,17 @@ const ESSENTIAL_PANELS = new Set([
   'overview', 'agents', 'tasks', 'chat', 'activity', 'logs', 'settings',
 ])
 
-// Tabs a non-admin (viewer) may render — mirrors nav-rail's VIEWER_VISIBLE.
-const VIEWER_TABS = new Set(['my-instance', 'chat'])
-
 function ContentRouter({ tab }: { tab: string }) {
   const tp = useTranslations('page')
   const { dashboardMode, interfaceMode, setInterfaceMode, currentUser } = useMissionControl()
   const navigateToPanel = useNavigateToPanel()
   const isLocal = dashboardMode === 'local'
+  const isAdmin = currentUser?.role === 'admin'
   const panelName = tab.replace(/-/g, ' ')
 
-  // PoC owner isolation: a non-admin (viewer) only ever renders the tabs allowlisted for
-  // them (mirrors nav-rail's VIEWER_VISIBLE) — any other URL falls back to their instance,
-  // so they cannot reach operator/host panels through the UI.
-  if (currentUser && currentUser.role !== 'admin' && !VIEWER_TABS.has(tab)) {
+  // Non-admins are scoped to their own pod: only the curated pod-backed panels are
+  // reachable; a deep-link to anything else bounces to their instance view.
+  if (currentUser && !isAdmin && !VIEWER_VISIBLE_PANELS.has(tab)) {
     return <MyInstancePanel />
   }
 
@@ -537,6 +539,7 @@ function ContentRouter({ tab }: { tab: string }) {
     case 'my-instance':
       return <MyInstancePanel />
     case 'overview':
+      if (!isAdmin) return <PodOverviewPanel />
       return (
         <>
           <Dashboard />
@@ -550,6 +553,7 @@ function ContentRouter({ tab }: { tab: string }) {
     case 'tasks':
       return <TaskBoardPanel />
     case 'agents':
+      if (!isAdmin) return <PodAgentRosterPanel />
       return (
         <>
           <OrchestrationBar />
@@ -564,15 +568,15 @@ function ContentRouter({ tab }: { tab: string }) {
     case 'sessions':
       return <ChatPagePanel />
     case 'logs':
-      return <LogViewerPanel />
+      return <LogViewerPanel podScoped={!isAdmin} />
     case 'cron':
-      return <CronManagementPanel />
+      return <CronManagementPanel podScoped={!isAdmin} />
     case 'memory':
       return <MemoryBrowserPanel />
     case 'cost-tracker':
     case 'tokens':
     case 'agent-costs':
-      return <CostTrackerPanel />
+      return <CostTrackerPanel podScoped={!isAdmin} />
     case 'users':
       return <UserManagementPanel />
     case 'history':
@@ -593,6 +597,7 @@ function ContentRouter({ tab }: { tab: string }) {
     case 'integrations':
       return <IntegrationsPanel />
     case 'settings':
+      if (!isAdmin) return <PodConfigPanel />
       return <SettingsPanel />
     case 'super-admin':
       return <SuperAdminPanel />
@@ -601,12 +606,13 @@ function ContentRouter({ tab }: { tab: string }) {
     case 'office':
       return <OfficePanel />
     case 'monitor':
+      if (!isAdmin) return <PodHealthPanel />
       return <SystemMonitorPanel />
     case 'skills':
-      return <SkillsPanel />
+      return <SkillsPanel podScoped={!isAdmin} />
     case 'channels':
       if (isLocal) return <LocalModeUnavailable panel={tab} />
-      return <ChannelsPanel />
+      return <ChannelsPanel podScoped={!isAdmin} />
     case 'nodes':
       if (isLocal) return <LocalModeUnavailable panel={tab} />
       return <NodesPanel />

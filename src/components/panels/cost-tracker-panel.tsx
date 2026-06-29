@@ -7,6 +7,9 @@ import { Loader } from '@/components/ui/loader'
 import { useMissionControl } from '@/store'
 import { createClientLogger } from '@/lib/client-logger'
 import { apiFetch } from '@/lib/api-client'
+import { useWebSocket } from '@/lib/websocket'
+import { useSmartPoll } from '@/lib/use-smart-poll'
+import { gatewayCostToOverview } from '@/components/chat/gateway-adapters'
 import {
   PieChart, Pie, Cell, LineChart, Line, XAxis, YAxis, CartesianGrid,
   Tooltip, Legend, ResponsiveContainer, BarChart, Bar,
@@ -90,10 +93,12 @@ type Timeframe = 'hour' | 'day' | 'week' | 'month'
 
 // ── Main Component ──────────────────────────────────
 
-export function CostTrackerPanel() {
+export function CostTrackerPanel({ podScoped }: { podScoped?: boolean } = {}) {
   const t = useTranslations('costTracker')
   const { sessions } = useMissionControl()
+  const { call, isConnected } = useWebSocket()
 
+  // ponytail: podScoped viewers can only read the Overview over the gateway.
   const [view, setView] = useState<View>('overview')
   const [timeframe, setTimeframe] = useState<Timeframe>('day')
   const [chartMode, setChartMode] = useState<'incremental' | 'cumulative'>('incremental')
@@ -114,6 +119,24 @@ export function CostTrackerPanel() {
   const timeframeToDays = (tf: Timeframe): number => {
     switch (tf) { case 'hour': case 'day': return 1; case 'week': return 7; case 'month': return 30 }
   }
+
+  // ponytail: gateway path — only Overview is backed by the pod (usage.cost).
+  const loadPodData = useCallback(async () => {
+    if (!isConnected) return
+    setIsLoading(true)
+    try {
+      const result = await call('usage.cost')
+      const { summary, trends } = gatewayCostToOverview(result)
+      // Reuse the existing UsageStats/TrendData view-models; per-model breakdown
+      // is unavailable from the gateway → empty `models`/`sessions`.
+      setUsageStats({ summary, models: {}, sessions: {}, timeframe, recordCount: 0 })
+      setTrendData({ trends, timeframe })
+    } catch (err) {
+      log.error('Failed to load pod cost data:', err)
+    } finally {
+      setIsLoading(false)
+    }
+  }, [call, isConnected, timeframe])
 
   const loadData = useCallback(async () => {
     setIsLoading(true)
@@ -158,12 +181,16 @@ export function CostTrackerPanel() {
     }
   }, [timeframe, usageStats])
 
-  useEffect(() => { loadData() }, [loadData])
+  useEffect(() => { if (podScoped) loadPodData(); else loadData() }, [loadData, loadPodData, podScoped])
   useEffect(() => {
+    if (podScoped) return
     refreshTimer.current = setInterval(loadData, 30_000)
     return () => { if (refreshTimer.current) clearInterval(refreshTimer.current) }
-  }, [loadData])
-  useEffect(() => { if (view === 'sessions') loadSessionCosts() }, [view, loadSessionCosts])
+  }, [loadData, podScoped])
+  useEffect(() => { if (!podScoped && view === 'sessions') loadSessionCosts() }, [view, loadSessionCosts, podScoped])
+
+  // ponytail: podScoped poll over the gateway (60s); no-op refresh when not podScoped.
+  useSmartPoll(() => { if (podScoped) return loadPodData() }, 60_000, { pauseWhenDisconnected: true, backoff: true })
 
   const exportData = async (format: 'json' | 'csv') => {
     setIsExporting(true)
@@ -207,7 +234,8 @@ export function CostTrackerPanel() {
             <p className="text-muted-foreground mt-1">{t('subtitle')}</p>
           </div>
           <div className="flex items-center gap-3">
-            {/* View tabs */}
+            {/* View tabs — hidden for podScoped viewers (Overview only) */}
+            {!podScoped && (
             <div className="flex rounded-lg border border-border overflow-hidden">
               {(['overview', 'agents', 'sessions', 'tasks'] as const).map(v => (
                 <button
@@ -221,6 +249,7 @@ export function CostTrackerPanel() {
                 </button>
               ))}
             </div>
+            )}
             {/* Timeframe */}
             <div className="flex space-x-1">
               {(['hour', 'day', 'week', 'month'] as const).map(tf => (
@@ -235,12 +264,12 @@ export function CostTrackerPanel() {
 
       {isLoading && !usageStats ? (
         <Loader variant="panel" label={t('loadingCostData')} />
-      ) : view === 'overview' ? (
+      ) : podScoped || view === 'overview' ? (
         <OverviewView
           stats={usageStats} trendData={trendData} agentSummary={agentSummary}
           taskData={taskData} timeframe={timeframe} chartMode={chartMode}
           setChartMode={setChartMode} exportData={exportData} isExporting={isExporting}
-          onRefresh={loadData}
+          onRefresh={podScoped ? loadPodData : loadData} podScoped={podScoped}
         />
       ) : view === 'agents' ? (
         <AgentsView
@@ -264,14 +293,14 @@ export function CostTrackerPanel() {
 
 function OverviewView({
   stats, trendData, agentSummary, taskData, timeframe, chartMode, setChartMode,
-  exportData, isExporting, onRefresh,
+  exportData, isExporting, onRefresh, podScoped,
 }: {
   stats: UsageStats | null; trendData: TrendData | null
   agentSummary: ByAgentResponse['summary'] | undefined; taskData: TaskCostsResponse | null
   timeframe: Timeframe; chartMode: 'incremental' | 'cumulative'
   setChartMode: (m: 'incremental' | 'cumulative') => void
   exportData: (f: 'json' | 'csv') => void; isExporting: boolean
-  onRefresh: () => void
+  onRefresh: () => void; podScoped?: boolean
 }) {
   const t = useTranslations('costTracker')
   if (!stats) {
@@ -319,8 +348,8 @@ function OverviewView({
 
   return (
     <div className="space-y-6">
-      {/* Summary cards */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+      {/* Summary cards — podScoped drops requestCount/agents/task tiles (gateway has only cost+tokens) */}
+      <div className={`grid grid-cols-2 ${podScoped ? 'md:grid-cols-2' : 'md:grid-cols-5'} gap-4`}>
         <div className="bg-card border border-border rounded-lg p-5">
           <div className="text-3xl font-bold text-foreground">{formatCost(stats.summary.totalCost)}</div>
           <div className="text-sm text-muted-foreground">{t('totalCost', { timeframe })}</div>
@@ -329,20 +358,26 @@ function OverviewView({
           <div className="text-3xl font-bold text-foreground">{formatNumber(stats.summary.totalTokens)}</div>
           <div className="text-sm text-muted-foreground">{t('totalTokens')}</div>
         </div>
+        {!podScoped && (
         <div className="bg-card border border-border rounded-lg p-5">
           <div className="text-3xl font-bold text-foreground">{formatNumber(stats.summary.requestCount)}</div>
           <div className="text-sm text-muted-foreground">{t('apiRequests')}</div>
         </div>
+        )}
+        {!podScoped && (
         <div className="bg-card border border-border rounded-lg p-5">
           <div className="text-3xl font-bold text-foreground">{agentSummary?.agent_count ?? '-'}</div>
           <div className="text-sm text-muted-foreground">{t('activeAgents')}</div>
         </div>
+        )}
+        {!podScoped && (
         <div className="bg-card border border-border rounded-lg p-5">
           <div className="text-3xl font-bold text-foreground">
             {taskData ? `${((1 - taskData.unattributed.totalCost / Math.max(stats.summary.totalCost, 0.0001)) * 100).toFixed(0)}%` : '-'}
           </div>
           <div className="text-sm text-muted-foreground">{t('taskAttributed')}</div>
         </div>
+        )}
       </div>
 
       {/* Charts */}
@@ -376,7 +411,8 @@ function OverviewView({
           </div>
         </div>
 
-        {/* Model bar chart */}
+        {/* Model bar chart — per-model breakdown unavailable over the gateway */}
+        {!podScoped && (
         <div className="bg-card border border-border rounded-lg p-6">
           <h2 className="text-xl font-semibold mb-4">{t('tokenUsageByModel')}</h2>
           <div className="h-64">
@@ -394,8 +430,10 @@ function OverviewView({
             )}
           </div>
         </div>
+        )}
 
-        {/* Cost pie */}
+        {/* Cost pie — per-model breakdown unavailable over the gateway */}
+        {!podScoped && (
         <div className="bg-card border border-border rounded-lg p-6">
           <h2 className="text-xl font-semibold mb-4">{t('costDistributionByModel')}</h2>
           <div className="h-64">
@@ -413,9 +451,10 @@ function OverviewView({
             )}
           </div>
         </div>
+        )}
       </div>
 
-      {/* Performance insights */}
+      {/* Performance insights — gated on models.length, empty in podScoped */}
       {models.length > 0 && (
         <div className="bg-card border border-border rounded-lg p-6">
           <h2 className="text-xl font-semibold mb-4">{t('performanceInsights')}</h2>
@@ -456,7 +495,8 @@ function OverviewView({
         </div>
       )}
 
-      {/* Export */}
+      {/* Export — host-only route, hidden for podScoped viewers */}
+      {!podScoped && (
       <div className="bg-card border border-border rounded-lg p-6">
         <div className="flex items-center justify-between">
           <div>
@@ -469,6 +509,7 @@ function OverviewView({
           </div>
         </div>
       </div>
+      )}
     </div>
   )
 }

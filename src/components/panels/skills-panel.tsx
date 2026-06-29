@@ -5,6 +5,9 @@ import { createPortal } from 'react-dom'
 import { useTranslations } from 'next-intl'
 import { useMissionControl } from '@/store'
 import { Button } from '@/components/ui/button'
+import { useWebSocket } from '@/lib/websocket'
+import { useSmartPoll } from '@/lib/use-smart-poll'
+import { gatewaySkillsToSkills } from '@/components/chat/gateway-adapters'
 
 interface SkillSummary {
   id: string
@@ -68,9 +71,10 @@ function getSourceLabel(source: string): string {
   return source
 }
 
-export function SkillsPanel() {
+export function SkillsPanel({ podScoped = false }: { podScoped?: boolean } = {}) {
   const t = useTranslations('skills')
   const { dashboardMode, skillsList, skillGroups, skillsTotal, setSkillsData } = useMissionControl()
+  const { call, isConnected } = useWebSocket()
   const [loading, setLoading] = useState(skillsList === null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -118,13 +122,27 @@ export function SkillsPanel() {
   const loadSkills = useCallback(async (opts?: { initial?: boolean }) => {
     if (opts?.initial) setLoading(true)
     setError(null)
+    if (podScoped) {
+      // Pod-owner viewers read their own pod's skills over the gateway WebSocket
+      // (`skills.status`); host /api/skills 403s them. Read-only — registry,
+      // create, edit, delete, scan, and content-drawer UI are hidden below.
+      if (!isConnected) {
+        if (opts?.initial) setLoading(false)
+        return
+      }
+      const result = await call('skills.status')
+      const { skills, groups, total } = gatewaySkillsToSkills(result)
+      setSkillsData(skills, groups, total)
+      if (opts?.initial) setLoading(false)
+      return
+    }
     const res = await fetch('/api/skills', { cache: 'no-store' })
     const body = await res.json()
     if (!res.ok) throw new Error(body?.error || 'Failed to load skills')
     const resp = body as SkillsResponse
     setSkillsData(resp.skills, resp.groups, resp.total)
     if (opts?.initial) setLoading(false)
-  }, [setSkillsData])
+  }, [setSkillsData, podScoped, call, isConnected])
 
   useEffect(() => {
     // Skip initial fetch if we already have cached data from a previous mount
@@ -144,13 +162,17 @@ export function SkillsPanel() {
     return () => { cancelled = true }
   }, [loadSkills, skillsList])
 
-  // Two-way disk sync: poll for external on-disk changes.
+  // Two-way disk sync: poll for external on-disk changes (host path only).
   useEffect(() => {
+    if (podScoped) return
     const id = window.setInterval(() => {
       loadSkills().catch(() => {})
     }, 10000)
     return () => window.clearInterval(id)
-  }, [loadSkills])
+  }, [loadSkills, podScoped])
+
+  // Pod-scoped: poll skills.status over the gateway WebSocket (only when enabled).
+  useSmartPoll(loadSkills, 60000, { pauseWhenDisconnected: true, backoff: true, enabled: podScoped })
 
   const filtered = useMemo(() => {
     let list = skillsList || []
@@ -417,12 +439,14 @@ export function SkillsPanel() {
           >
             {t('tabInstalled')}
           </button>
-          <button
-            onClick={() => setActiveTab('registry')}
-            className={`px-3 py-1.5 text-xs rounded-md transition-colors ${activeTab === 'registry' ? 'bg-primary text-primary-foreground' : 'bg-secondary/50 text-muted-foreground hover:text-foreground'}`}
-          >
-            {t('tabRegistry')}
-          </button>
+          {!podScoped && (
+            <button
+              onClick={() => setActiveTab('registry')}
+              className={`px-3 py-1.5 text-xs rounded-md transition-colors ${activeTab === 'registry' ? 'bg-primary text-primary-foreground' : 'bg-secondary/50 text-muted-foreground hover:text-foreground'}`}
+            >
+              {t('tabRegistry')}
+            </button>
+          )}
         </div>
       </div>
 
@@ -465,6 +489,9 @@ export function SkillsPanel() {
             </div>
           )}
 
+          {/* Host-only management card: scan-all + create-skill form. Hidden in
+              pod-scoped (read-only) mode — these hit host /api/skills routes. */}
+          {!podScoped && (
           <div className="rounded-lg border border-border bg-card p-3 space-y-2">
             <div className="flex items-center justify-between gap-2">
               <div className="text-xs text-muted-foreground">{t('diskSyncActive')}</div>
@@ -545,6 +572,7 @@ export function SkillsPanel() {
             />
             {createError && <p className="text-xs text-destructive">{createError}</p>}
           </div>
+          )}
 
           {loading ? (
             <div className="rounded-lg border border-border bg-card px-4 py-6 text-sm text-muted-foreground">{t('loadingSkills')}</div>
@@ -612,12 +640,16 @@ export function SkillsPanel() {
                             }`}>
                               {getSourceLabel(skill.source)}
                             </span>
-                            <Button variant="outline" size="xs" onClick={() => checkSecurity(skill)}>
-                              {t('scan')}
-                            </Button>
-                            <Button variant="outline" size="xs" onClick={() => setSelectedSkill(skill)}>
-                              {t('view')}
-                            </Button>
+                            {!podScoped && (
+                              <>
+                                <Button variant="outline" size="xs" onClick={() => checkSecurity(skill)}>
+                                  {t('scan')}
+                                </Button>
+                                <Button variant="outline" size="xs" onClick={() => setSelectedSkill(skill)}>
+                                  {t('view')}
+                                </Button>
+                              </>
+                            )}
                           </div>
                         </div>
                         {skill.description && (
@@ -634,7 +666,7 @@ export function SkillsPanel() {
         </>
       )}
 
-      {activeTab === 'registry' && (
+      {!podScoped && activeTab === 'registry' && (
         <>
           <div className="rounded-lg border border-border bg-card p-3 space-y-3">
             <div className="flex items-center gap-2">
@@ -738,7 +770,7 @@ export function SkillsPanel() {
         </>
       )}
 
-      {isMounted && installModal && createPortal(
+      {!podScoped && isMounted && installModal && createPortal(
         <div className="fixed inset-0 z-[130]">
           <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
           <div className="absolute inset-0 flex items-center justify-center p-4">
@@ -829,7 +861,7 @@ export function SkillsPanel() {
         document.body
       )}
 
-      {isMounted && selectedSkill && createPortal(
+      {!podScoped && isMounted && selectedSkill && createPortal(
         <div className="fixed inset-0 z-[120]">
           <div className="absolute inset-0 bg-black/40" onClick={() => setSelectedSkill(null)} />
           <aside className="absolute right-0 top-0 h-full w-[min(52rem,100vw)] bg-card border-l border-border shadow-2xl flex flex-col">

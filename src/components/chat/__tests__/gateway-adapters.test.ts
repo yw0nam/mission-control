@@ -7,6 +7,13 @@ import {
   gatewayMessageToChatMessage,
   gatewayAgentsToAgents,
   mergeHistoryWithPending,
+  gatewaySkillsToSkills,
+  parseGatewayLogLine,
+  gatewayLogsToEntries,
+  gatewayCostToOverview,
+  gatewayStatusToOverview,
+  gatewayHealthToPodHealth,
+  gatewayRosterFromStatus,
   type GatewaySession,
 } from '../gateway-adapters'
 import type { ChatMessage } from '@/store'
@@ -337,5 +344,194 @@ describe('mergeHistoryWithPending', () => {
     const current = [historyMsg('earlier', 1), pending('new turn', -1, 'sending')]
     const merged = mergeHistoryWithPending(history, current)
     expect(merged).toEqual(history)
+  })
+})
+
+describe('gatewaySkillsToSkills', () => {
+  // Real shape captured from skills.status on tenant alice.
+  const fixture = {
+    workspaceDir: '/home/openclaw/.openclaw/workspace',
+    skills: [
+      { name: '1password', description: 'Use 1Password CLI', source: 'openclaw-bundled', skillKey: '1password', filePath: '/app/skills/1password/SKILL.md', emoji: '🔐', eligible: false },
+      { name: 'git', description: 'git helper', source: 'openclaw-bundled', skillKey: 'git', filePath: '/app/skills/git/SKILL.md' },
+      { name: 'custom', description: 'a custom one', source: 'workspace', skillKey: 'custom', filePath: '/ws/custom/SKILL.md' },
+    ],
+  }
+
+  it('maps gateway skills to SkillSummary rows (id←skillKey, path←filePath)', () => {
+    const { skills, total } = gatewaySkillsToSkills(fixture)
+    expect(total).toBe(3)
+    expect(skills[0]).toEqual({
+      id: '1password',
+      name: '1password',
+      source: 'openclaw-bundled',
+      path: '/app/skills/1password/SKILL.md',
+      description: 'Use 1Password CLI',
+      registry_slug: null,
+      security_status: null,
+    })
+  })
+
+  it('synthesizes groups by source', () => {
+    const { groups } = gatewaySkillsToSkills(fixture)
+    const bundled = groups.find((g) => g.source === 'openclaw-bundled')
+    const ws = groups.find((g) => g.source === 'workspace')
+    expect(bundled?.skills).toHaveLength(2)
+    expect(ws?.skills).toHaveLength(1)
+  })
+
+  it('tolerates junk', () => {
+    expect(gatewaySkillsToSkills(null)).toEqual({ skills: [], groups: [], total: 0 })
+    expect(gatewaySkillsToSkills({ skills: [{ no: 'name' }] })).toEqual({ skills: [], groups: [], total: 0 })
+  })
+})
+
+describe('parseGatewayLogLine / gatewayLogsToEntries', () => {
+  // Real line captured from logs.tail on tenant alice.
+  const realLine =
+    '{"0":"{\\"subsystem\\":\\"gateway/ws\\"}","1":"\\u21c4 res \\u2713 skills.status 213ms","_meta":{"runtime":"node","hostname":"alice-0","parentNames":["openclaw"],"date":"2026-06-29T03:19:28.518Z","logLevelName":"INFO"},"time":"2026-06-29T03:19:28.519Z"}'
+
+  it('parses a real gateway log line into a LogEntry', () => {
+    const entry = parseGatewayLogLine(realLine, 0)
+    expect(entry.level).toBe('info')
+    expect(entry.source).toBe('gateway/ws')
+    expect(entry.message).toBe('⇄ res ✓ skills.status 213ms')
+    expect(entry.timestamp).toBe(Date.parse('2026-06-29T03:19:28.519Z'))
+    expect(entry.id).toContain('-0')
+  })
+
+  it('extracts the human message from a multi-arg line (message under "2", not "1")', () => {
+    // Real shape: log({subsystem}, {structured}, "heartbeat: started")
+    const line =
+      '{"0":"{\\"subsystem\\":\\"gateway/heartbeat\\"}","1":{"intervalMs":1800000},"2":"heartbeat: started","_meta":{"logLevelName":"INFO","parentNames":["openclaw"]},"time":"2026-06-29T02:49:47.066Z"}'
+    const entry = parseGatewayLogLine(line, 0)
+    expect(entry.source).toBe('gateway/heartbeat')
+    expect(entry.message).toBe('heartbeat: started')
+  })
+
+  it('maps WARN/ERROR/FATAL/TRACE level names', () => {
+    const mk = (lvl: string) => parseGatewayLogLine(`{"1":"m","_meta":{"logLevelName":"${lvl}"},"time":"x"}`, 0, 1000).level
+    expect(mk('WARN')).toBe('warn')
+    expect(mk('ERROR')).toBe('error')
+    expect(mk('FATAL')).toBe('error')
+    expect(mk('TRACE')).toBe('debug')
+  })
+
+  it('falls back to the raw string for non-JSON lines', () => {
+    const entry = parseGatewayLogLine('plain text log', 2, 1000)
+    expect(entry.message).toBe('plain text log')
+    expect(entry.level).toBe('info')
+    expect(entry.timestamp).toBe(1000)
+  })
+
+  it('gatewayLogsToEntries maps the lines array and tolerates junk', () => {
+    expect(gatewayLogsToEntries({ lines: [realLine] })).toHaveLength(1)
+    expect(gatewayLogsToEntries(null)).toEqual([])
+  })
+})
+
+describe('gatewayCostToOverview', () => {
+  const fixture = {
+    updatedAt: 1,
+    days: 2,
+    daily: [
+      { date: '2026-06-26', totalTokens: 9545, totalCost: 0 },
+      { date: '2026-06-27', totalTokens: 100, totalCost: 1.5 },
+    ],
+    totals: { totalTokens: 9645, totalCost: 1.5, input: 9517, output: 28 },
+  }
+
+  it('maps totals to the summary and daily to trends', () => {
+    const { summary, trends } = gatewayCostToOverview(fixture)
+    expect(summary.totalTokens).toBe(9645)
+    expect(summary.totalCost).toBe(1.5)
+    expect(trends).toEqual([
+      { timestamp: '2026-06-26', tokens: 9545, cost: 0, requests: 0 },
+      { timestamp: '2026-06-27', tokens: 100, cost: 1.5, requests: 0 },
+    ])
+  })
+
+  it('tolerates junk', () => {
+    expect(gatewayCostToOverview(null)).toEqual({
+      summary: { totalTokens: 0, totalCost: 0, requestCount: 0, avgTokensPerRequest: 0, avgCostPerRequest: 0 },
+      trends: [],
+    })
+  })
+})
+
+describe('gatewayStatusToOverview', () => {
+  const fixture = {
+    heartbeat: { defaultAgentId: 'main', agents: [{ id: 'main' }] },
+    sessions: {
+      count: 10,
+      recent: [
+        { key: 'agent:main:main', agentId: 'main', model: 'GPT-OSS-120B', totalTokens: 10677, updatedAt: 1782700471279 },
+      ],
+    },
+  }
+
+  it('maps status into the pod overview view-model', () => {
+    const o = gatewayStatusToOverview(fixture)
+    expect(o.defaultAgentId).toBe('main')
+    expect(o.sessionCount).toBe(10)
+    expect(o.recent[0]).toEqual({
+      key: 'agent:main:main',
+      agentId: 'main',
+      model: 'GPT-OSS-120B',
+      totalTokens: 10677,
+      updatedAtMs: 1782700471279,
+    })
+  })
+
+  it('tolerates junk', () => {
+    expect(gatewayStatusToOverview(null)).toEqual({ defaultAgentId: undefined, sessionCount: 0, recent: [] })
+  })
+})
+
+describe('gatewayHealthToPodHealth', () => {
+  it('maps health into the pod health view-model', () => {
+    const h = gatewayHealthToPodHealth({
+      ok: true,
+      durationMs: 12,
+      heartbeatSeconds: 30,
+      defaultAgentId: 'main',
+      agents: [{ agentId: 'main', isDefault: true }],
+      sessions: { count: 5 },
+    })
+    expect(h).toEqual({ ok: true, durationMs: 12, heartbeatSeconds: 30, defaultAgentId: 'main', agents: ['main'], sessionCount: 5 })
+  })
+
+  it('tolerates junk', () => {
+    expect(gatewayHealthToPodHealth(null).ok).toBe(false)
+  })
+})
+
+describe('gatewayRosterFromStatus', () => {
+  const agents = { defaultId: 'main', mainKey: 'main', agents: [{ id: 'main' }, { id: 'helper' }] }
+  const status = {
+    sessions: {
+      byAgent: [
+        {
+          agentId: 'main',
+          count: 10,
+          recent: [
+            { model: 'GPT-OSS-120B', updatedAt: 100 },
+            { model: 'GPT-OSS-120B', updatedAt: 500 },
+          ],
+        },
+      ],
+    },
+  }
+
+  it('joins the id-only roster with per-agent session stats', () => {
+    const rows = gatewayRosterFromStatus(agents, status)
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toEqual({ id: 'main', sessionCount: 10, model: 'GPT-OSS-120B', lastActivityMs: 500 })
+    // agent with no session stats still appears, zeroed
+    expect(rows[1]).toEqual({ id: 'helper', sessionCount: 0, model: undefined, lastActivityMs: 0 })
+  })
+
+  it('tolerates junk', () => {
+    expect(gatewayRosterFromStatus(null, null)).toEqual([])
   })
 })

@@ -11,7 +11,7 @@
  *
  * Kept free of DOM/node imports so it can be unit-tested in isolation.
  */
-import type { Conversation, ChatMessage, Agent } from '@/store'
+import type { Conversation, ChatMessage, Agent, LogEntry } from '@/store'
 import type { SessionTranscriptMessage } from './session-message'
 
 export interface GatewaySession {
@@ -337,4 +337,283 @@ export function gatewayMessageToChatMessage(
     message_type: 'text',
     created_at: createdAt,
   }
+}
+
+// --- pod-scoped panel re-source adapters --------------------------------------
+// Map gateway RPC payloads into the existing panel view-models so a viewer can
+// read their own pod over /ws/gateway. Shapes captured live against tenant alice
+// (openclaw 2026.2.3). All pure / unit-testable.
+
+export interface SkillRow {
+  id: string
+  name: string
+  source: string
+  path: string
+  description?: string
+  registry_slug?: string | null
+  security_status?: string | null
+}
+export interface SkillGroupRow {
+  source: string
+  path: string
+  skills: SkillRow[]
+}
+
+/**
+ * Map `skills.status` (`{ skills: [{ name, description, source, skillKey, filePath, … }] }`)
+ * into the SkillsPanel view-model. `groups` are synthesized by `source`; `total` is the count.
+ * `registry_slug`/`security_status` are host-only concepts → null. Tolerates junk.
+ */
+export function gatewaySkillsToSkills(
+  result: unknown,
+): { skills: SkillRow[]; groups: SkillGroupRow[]; total: number } {
+  const list = isObject(result) && Array.isArray(result.skills) ? result.skills : []
+  const skills = list
+    .map((s): SkillRow | null => {
+      if (!isObject(s) || typeof s.name !== 'string') return null
+      return {
+        id: typeof s.skillKey === 'string' ? s.skillKey : s.name,
+        name: s.name,
+        source: typeof s.source === 'string' ? s.source : 'unknown',
+        path: typeof s.filePath === 'string' ? s.filePath : typeof s.baseDir === 'string' ? s.baseDir : '',
+        description: typeof s.description === 'string' ? s.description : undefined,
+        registry_slug: null,
+        security_status: null,
+      }
+    })
+    .filter((s): s is SkillRow => s !== null)
+  const groupMap = new Map<string, SkillGroupRow>()
+  for (const s of skills) {
+    let g = groupMap.get(s.source)
+    if (!g) {
+      g = { source: s.source, path: '', skills: [] }
+      groupMap.set(s.source, g)
+    }
+    g.skills.push(s)
+  }
+  return { skills, groups: [...groupMap.values()], total: skills.length }
+}
+
+// openclaw tslog level names → MC LogEntry levels.
+const LOG_LEVEL_MAP: Record<string, LogEntry['level']> = {
+  trace: 'debug',
+  silly: 'debug',
+  debug: 'debug',
+  info: 'info',
+  warn: 'warn',
+  error: 'error',
+  fatal: 'error',
+}
+
+/**
+ * Parse one `logs.tail` line into a `LogEntry`. Each line is a JSON object like
+ * `{ "0":subsystemJson, "1":message, _meta:{ logLevelName, date, parentNames }, time }`.
+ * Falls back to the raw string as the message when the line is not parseable JSON.
+ */
+export function parseGatewayLogLine(line: string, index = 0, nowMs: number = Date.now()): LogEntry {
+  let level: LogEntry['level'] = 'info'
+  let timestamp = nowMs
+  let source = 'gateway'
+  let message = line
+  try {
+    const o = JSON.parse(line)
+    if (isObject(o)) {
+      const meta = isObject(o._meta) ? o._meta : {}
+      const lvl = typeof meta.logLevelName === 'string' ? meta.logLevelName.toLowerCase() : ''
+      level = LOG_LEVEL_MAP[lvl] ?? 'info'
+      const t = typeof o.time === 'string' ? o.time : typeof meta.date === 'string' ? meta.date : ''
+      const parsed = Date.parse(t)
+      if (Number.isFinite(parsed)) timestamp = parsed
+      // Positional log args live under numeric keys: "0" is the subsystem context
+      // (`{"subsystem":"…"}`), and the human message is the LAST string positional
+      // (a multi-arg call like log({...}, "started") puts it under "1", "2", …).
+      const numKeys = Object.keys(o)
+        .filter((k) => /^\d+$/.test(k))
+        .sort((a, b) => Number(a) - Number(b))
+      let usedZeroAsSource = false
+      const f0 = o['0']
+      if (typeof f0 === 'string') {
+        try {
+          const sub = JSON.parse(f0)
+          if (isObject(sub) && typeof sub.subsystem === 'string') {
+            source = sub.subsystem
+            usedZeroAsSource = true
+          }
+        } catch {
+          /* leave default */
+        }
+      } else if (Array.isArray(meta.parentNames) && typeof meta.parentNames[0] === 'string') {
+        source = meta.parentNames[0]
+      }
+      let msg: string | undefined
+      for (const k of numKeys) {
+        if (k === '0' && usedZeroAsSource) continue
+        if (typeof o[k] === 'string') msg = o[k] as string
+      }
+      if (msg !== undefined) message = msg
+      else if (typeof o.message === 'string') message = o.message
+    }
+  } catch {
+    /* not JSON — keep the raw line as the message */
+  }
+  return { id: `${timestamp}-${index}`, timestamp, level, source, message }
+}
+
+/** Map the full `logs.tail` result into `LogEntry[]` (oldest→newest as returned). */
+export function gatewayLogsToEntries(result: unknown, nowMs: number = Date.now()): LogEntry[] {
+  const lines = isObject(result) && Array.isArray(result.lines) ? result.lines : []
+  return lines.map((l, i) => parseGatewayLogLine(typeof l === 'string' ? l : String(l), i, nowMs))
+}
+
+export interface CostSummary {
+  totalTokens: number
+  totalCost: number
+  requestCount: number
+  avgTokensPerRequest: number
+  avgCostPerRequest: number
+}
+export interface CostTrendPoint {
+  timestamp: string
+  tokens: number
+  cost: number
+  requests: number
+}
+
+function num(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0
+}
+
+/**
+ * Map `usage.cost` (`{ totals:{ totalTokens, totalCost, … }, daily:[{ date, totalTokens, totalCost }] }`)
+ * into the CostTracker Overview view-model. `requestCount` is unavailable from the gateway → 0.
+ */
+export function gatewayCostToOverview(
+  result: unknown,
+): { summary: CostSummary; trends: CostTrendPoint[] } {
+  const totals = isObject(result) && isObject(result.totals) ? result.totals : {}
+  const summary: CostSummary = {
+    totalTokens: num(totals.totalTokens),
+    totalCost: num(totals.totalCost),
+    requestCount: 0,
+    avgTokensPerRequest: 0,
+    avgCostPerRequest: 0,
+  }
+  const daily = isObject(result) && Array.isArray(result.daily) ? result.daily : []
+  const trends = daily.filter(isObject).map(
+    (d): CostTrendPoint => ({
+      timestamp: typeof d.date === 'string' ? d.date : '',
+      tokens: num(d.totalTokens),
+      cost: num(d.totalCost),
+      requests: 0,
+    }),
+  )
+  return { summary, trends }
+}
+
+export interface PodSessionRow {
+  key: string
+  agentId?: string
+  model?: string
+  totalTokens: number
+  updatedAtMs: number
+}
+export interface PodOverview {
+  defaultAgentId?: string
+  sessionCount: number
+  recent: PodSessionRow[]
+}
+
+function mapPodSession(r: unknown): PodSessionRow | null {
+  if (!isObject(r) || typeof r.key !== 'string') return null
+  return {
+    key: r.key,
+    agentId: typeof r.agentId === 'string' ? r.agentId : undefined,
+    model: typeof r.model === 'string' ? r.model : undefined,
+    totalTokens: num(r.totalTokens),
+    updatedAtMs: num(r.updatedAt),
+  }
+}
+
+/** Map `status` into the PodOverviewPanel view-model. */
+export function gatewayStatusToOverview(result: unknown): PodOverview {
+  const heartbeat = isObject(result) && isObject(result.heartbeat) ? result.heartbeat : {}
+  const sessions = isObject(result) && isObject(result.sessions) ? result.sessions : {}
+  const recentRaw = Array.isArray(sessions.recent) ? sessions.recent : []
+  return {
+    defaultAgentId: typeof heartbeat.defaultAgentId === 'string' ? heartbeat.defaultAgentId : undefined,
+    sessionCount: num(sessions.count),
+    recent: recentRaw.map(mapPodSession).filter((r): r is PodSessionRow => r !== null),
+  }
+}
+
+export interface PodHealth {
+  ok: boolean
+  durationMs: number
+  heartbeatSeconds: number
+  defaultAgentId?: string
+  agents: string[]
+  sessionCount: number
+}
+
+/** Map `health` into the PodHealthPanel view-model. */
+export function gatewayHealthToPodHealth(result: unknown): PodHealth {
+  const r = isObject(result) ? result : {}
+  const sessions = isObject(r.sessions) ? r.sessions : {}
+  const agentsRaw = Array.isArray(r.agents) ? r.agents : []
+  const agents = agentsRaw
+    .map((a) =>
+      typeof a === 'string'
+        ? a
+        : isObject(a) && typeof a.agentId === 'string'
+          ? a.agentId
+          : isObject(a) && typeof a.id === 'string'
+            ? a.id
+            : null,
+    )
+    .filter((a): a is string => a !== null)
+  return {
+    ok: r.ok === true,
+    durationMs: num(r.durationMs),
+    heartbeatSeconds: num(r.heartbeatSeconds),
+    defaultAgentId: typeof r.defaultAgentId === 'string' ? r.defaultAgentId : undefined,
+    agents,
+    sessionCount: num(sessions.count),
+  }
+}
+
+export interface PodAgentRow {
+  id: string
+  sessionCount: number
+  model?: string
+  lastActivityMs: number
+}
+
+/**
+ * Join `agents.list` (id-only roster) with `status.sessions.byAgent` to produce the
+ * PodAgentRosterPanel rows (session count + model + last activity per agent).
+ */
+export function gatewayRosterFromStatus(agentsResult: unknown, statusResult: unknown): PodAgentRow[] {
+  const list = isObject(agentsResult) && Array.isArray(agentsResult.agents) ? agentsResult.agents : []
+  const sessions = isObject(statusResult) && isObject(statusResult.sessions) ? statusResult.sessions : {}
+  const byAgent = Array.isArray(sessions.byAgent) ? sessions.byAgent : []
+  const stats = new Map<string, { count: number; model?: string; lastActivityMs: number }>()
+  for (const a of byAgent) {
+    if (!isObject(a) || typeof a.agentId !== 'string') continue
+    const recent = Array.isArray(a.recent) ? a.recent : []
+    let model: string | undefined
+    let last = 0
+    for (const r of recent) {
+      if (!isObject(r)) continue
+      if (!model && typeof r.model === 'string') model = r.model
+      if (typeof r.updatedAt === 'number' && r.updatedAt > last) last = r.updatedAt
+    }
+    stats.set(a.agentId, { count: num(a.count) || recent.length, model, lastActivityMs: last })
+  }
+  return list
+    .map((entry): PodAgentRow | null => {
+      if (!isObject(entry) || typeof entry.id !== 'string') return null
+      const s = stats.get(entry.id)
+      return { id: entry.id, sessionCount: s?.count ?? 0, model: s?.model, lastActivityMs: s?.lastActivityMs ?? 0 }
+    })
+    .filter((r): r is PodAgentRow => r !== null)
 }
