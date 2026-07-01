@@ -29,7 +29,6 @@ const navGroups: NavGroup[] = [
   {
     id: 'core',
     items: [
-      { id: 'my-instance', label: 'My Instance', icon: <OverviewIcon />, priority: true, essential: true },
       { id: 'overview', label: 'Overview', icon: <OverviewIcon />, priority: true, essential: true },
       { id: 'agents', label: 'Agents', icon: <AgentsIcon />, priority: true, essential: true },
       { id: 'tasks', label: 'Tasks', icon: <TasksIcon />, priority: true, essential: true },
@@ -124,10 +123,7 @@ const gatewayOnlyPanels = new Set([
   'gateways', 'gateway-config', 'channels', 'nodes', 'exec-approvals',
   ...getPluginNavItems().filter(pi => pi.gatewayOnly).map(pi => pi.id),
 ])
-// PoC owner isolation: a non-admin (owner) sees ONLY their own instance panel —
-// every operator/host view is hidden. `my-instance` is hidden from admins (they
-// manage tenants from the admin views instead).
-const OWNER_PANEL = 'my-instance'
+const adminOnlyPanels = new Set<string>([])
 
 export function NavRail() {
   const { activeTab, connection, dashboardMode, currentUser, activeTenant, tenants, osUsers, setActiveTenant, fetchTenants, fetchOsUsers, activeProject, projects, setActiveProject, fetchProjects, sidebarExpanded, collapsedGroups, toggleSidebar, toggleGroup, defaultOrgName, interfaceMode, setInterfaceMode } = useMissionControl()
@@ -188,9 +184,7 @@ export function NavRail() {
           return { ...i, children: filteredChildren }
         }
         if (isLocal && gatewayOnlyPanels.has(i.id)) return null
-        // Owner sees only their instance; admin sees everything except the owner panel.
-        if (!isAdmin && i.id !== OWNER_PANEL) return null
-        if (isAdmin && i.id === OWNER_PANEL) return null
+        if (!isAdmin && adminOnlyPanels.has(i.id)) return null
         if (isEssential && !i.essential) return null
         return i
       })
