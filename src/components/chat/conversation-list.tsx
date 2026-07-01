@@ -22,6 +22,7 @@ type SessionRecord = {
   tokens?: string
   age?: string
   active?: boolean
+  stale?: boolean
   startTime?: number
   lastActivity?: number
   workingDir?: string | null
@@ -77,6 +78,7 @@ function readSessions(payload: unknown): SessionRecord[] {
       tokens: readString(session?.tokens),
       age: readString(session?.age),
       active: typeof session?.active === 'boolean' ? session.active : undefined,
+      stale: typeof session?.stale === 'boolean' ? session.stale : undefined,
       startTime: readNumber(session?.startTime),
       lastActivity: readNumber(session?.lastActivity),
       workingDir: typeof session?.workingDir === 'string' || session?.workingDir === null ? session.workingDir : undefined,
@@ -309,6 +311,7 @@ export function ConversationList({ onNewConversation }: ConversationListProps) {
               workingDir: s.workingDir || null,
               lastUserPrompt: s.lastUserPrompt || null,
               active: !!s.active,
+              stale: !!s.stale,
               age: s.age,
             },
             participants: [],
@@ -495,6 +498,14 @@ export function ConversationList({ onNewConversation }: ConversationListProps) {
               <div className="flex items-center gap-1.5 mt-1 flex-wrap">
                 {isSessionRow && session?.sessionKind && session.sessionKind !== 'gateway' && (
                   <SessionKindPill kind={session.sessionKind} />
+                )}
+                {isSessionRow && session?.stale && (
+                  <span
+                    className="rounded px-1 py-px text-[9px] font-medium bg-amber-500/15 text-amber-400/80"
+                    title="Pod suspended - starts on interaction"
+                  >
+                    suspended
+                  </span>
                 )}
                 {workDirLeaf && (
                   <span className="text-[10px] text-muted-foreground/50 font-mono truncate max-w-[8rem]" title={session?.workingDir || ''}>

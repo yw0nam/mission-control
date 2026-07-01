@@ -29,12 +29,10 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'key is required' }, { status: 400 })
   }
 
-  const stateDir = config.openclawStateDir
-  if (!stateDir) {
-    return NextResponse.json({ messages: [], source: 'gateway', error: 'OPENCLAW_STATE_DIR not configured' })
-  }
-
   try {
+    // Try the live RPC first: remote pods keep transcripts inside the pod, so
+    // the disk fallback below is empty there. This must run before the
+    // stateDir gate, which only guards the on-disk fallback.
     try {
       const history = await callOpenClawGateway<{ messages?: unknown[] }>(
         'chat.history',
@@ -47,6 +45,12 @@ export async function GET(request: NextRequest) {
       }
     } catch (rpcErr) {
       logger.warn({ err: rpcErr, sessionKey }, 'Gateway chat.history failed, falling back to disk transcript')
+    }
+
+    // Disk fallback requires OPENCLAW_STATE_DIR (empty in remote-only deploys).
+    const stateDir = config.openclawStateDir
+    if (!stateDir) {
+      return NextResponse.json({ messages: [], source: 'gateway', error: 'OPENCLAW_STATE_DIR not configured' })
     }
 
     // Extract agent name from session key (e.g. "agent:jarv:main" -> "jarv")

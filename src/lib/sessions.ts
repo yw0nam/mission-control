@@ -17,6 +17,8 @@ export interface GatewaySession {
   outputTokens: number
   contextTokens: number
   active: boolean
+  /** True when served from the KV cache because the live RPC failed (suspended pod). */
+  stale?: boolean
 }
 
 function getGatewaySessionStoreFiles(): string[] {

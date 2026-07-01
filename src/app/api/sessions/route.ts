@@ -6,6 +6,7 @@ import { scanHermesSessions } from '@/lib/hermes-sessions'
 import { scanOpenCodeSessions } from '@/lib/opencode-sessions'
 import { getDatabase, db_helpers } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
+import { config } from '@/lib/config'
 import { callOpenClawGateway } from '@/lib/openclaw-gateway'
 import { getDetectedGatewayToken } from '@/lib/gateway-runtime'
 import { mutationLimiter } from '@/lib/rate-limit'
@@ -25,6 +26,11 @@ const GATEWAY_RPC_ACTIVE_WINDOW_MS = 60 * 60 * 1000
 const GATEWAY_RPC_TTL_MS = 10_000
 let _rpcSessionCache: { data: ReturnType<typeof mapGatewayRpcSessions>; ts: number } | null = null
 
+// Persist the last-good session list in the `settings` KV so a suspended pod
+// (sessions.list -> [] / error) still lists its conversations, served stale.
+// Per-gateway blob, overwrite-on-success. PASSIVE: never triggers a wake.
+const GATEWAY_SESSIONS_CACHE_KEY = `gateway_sessions_cache:${config.gatewaySlug || 'default'}`
+
 async function getGatewayRpcSessions(): Promise<ReturnType<typeof mapGatewayRpcSessions>> {
   if (!getDetectedGatewayToken()) return [] // local-only deploy: no remote gateway
   const now = Date.now()
@@ -35,10 +41,47 @@ async function getGatewayRpcSessions(): Promise<ReturnType<typeof mapGatewayRpcS
     const payload = await callOpenClawGateway<unknown>('sessions.list', {}, 8000)
     const mapped = mapGatewayRpcSessions(payload, { now, activeWithinMs: GATEWAY_RPC_ACTIVE_WINDOW_MS })
     _rpcSessionCache = { data: mapped, ts: now }
+    // Overwrite the display cache with the fresh list (raw upsert, mirrors
+    // session-prefs). updated_at is unix seconds.
+    try {
+      getDatabase()
+        .prepare(`
+          INSERT INTO settings (key, value, description, category, updated_by, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at
+        `)
+        .run(
+          GATEWAY_SESSIONS_CACHE_KEY,
+          JSON.stringify(mapped),
+          'Last-good gateway sessions.list, served stale when the pod is suspended',
+          'cache',
+          'system',
+          Math.floor(Date.now() / 1000),
+        )
+    } catch (cacheErr) {
+      logger.warn({ err: cacheErr }, 'Failed to persist gateway sessions cache')
+    }
     return mapped
   } catch (err) {
-    logger.warn({ err }, 'Gateway sessions.list RPC failed; using local session stores only')
-    return []
+    logger.warn({ err }, 'Gateway sessions.list RPC failed; serving cached sessions (stale)')
+    try {
+      const row = getDatabase()
+        .prepare('SELECT value FROM settings WHERE key = ?')
+        .get(GATEWAY_SESSIONS_CACHE_KEY) as { value?: string } | undefined
+      let cached: ReturnType<typeof mapGatewayRpcSessions> = []
+      try {
+        const parsed = JSON.parse(row?.value || '[]')
+        if (Array.isArray(parsed)) cached = parsed
+      } catch {
+        cached = []
+      }
+      return cached.map((s) => ({ ...s, stale: true }))
+    } catch (cacheErr) {
+      logger.warn({ err: cacheErr }, 'Failed to read cached gateway sessions')
+      return []
+    }
   }
 }
 
@@ -222,7 +265,9 @@ function mapGatewaySessions(gatewaySessions: ReturnType<typeof getAllGatewaySess
       tokens: `${formatTokens(totalTokens)}/${formatTokens(context)} (${pct}%)`,
       channel: s.channel,
       flags: [],
-      active: s.active,
+      // Stale (cache-served) sessions belong to a suspended pod: never "active".
+      active: s.stale ? false : s.active,
+      stale: s.stale,
       startTime: s.updatedAt,
       lastActivity: s.updatedAt,
       source: 'gateway' as const,
