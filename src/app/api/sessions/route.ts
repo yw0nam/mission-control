@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { getAllGatewaySessions } from '@/lib/sessions'
+import { getAllGatewaySessions, mapGatewayRpcSessions } from '@/lib/sessions'
 import { syncClaudeSessions } from '@/lib/claude-sessions'
 import { scanCodexSessions } from '@/lib/codex-sessions'
 import { scanHermesSessions } from '@/lib/hermes-sessions'
@@ -7,6 +7,7 @@ import { scanOpenCodeSessions } from '@/lib/opencode-sessions'
 import { getDatabase, db_helpers } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { callOpenClawGateway } from '@/lib/openclaw-gateway'
+import { getDetectedGatewayToken } from '@/lib/gateway-runtime'
 import { mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 
@@ -15,12 +16,41 @@ import { logger } from '@/lib/logger'
 // scanner's threshold so derived/scanned active state stay coherent.
 const LOCAL_SESSION_ACTIVE_WINDOW_MS = 15 * 60 * 1000
 
+// Remote pods keep their session store inside the pod, so the on-disk scan in
+// getAllGatewaySessions() finds nothing. When a gateway token is configured we
+// also pull sessions live via the `sessions.list` RPC. Short TTL cache so the
+// sidebar's poll doesn't open a WS handshake on every request.
+// ponytail: 10s TTL, fine because the sidebar polls slowly; tighten if it lags.
+const GATEWAY_RPC_ACTIVE_WINDOW_MS = 60 * 60 * 1000
+const GATEWAY_RPC_TTL_MS = 10_000
+let _rpcSessionCache: { data: ReturnType<typeof mapGatewayRpcSessions>; ts: number } | null = null
+
+async function getGatewayRpcSessions(): Promise<ReturnType<typeof mapGatewayRpcSessions>> {
+  if (!getDetectedGatewayToken()) return [] // local-only deploy: no remote gateway
+  const now = Date.now()
+  if (_rpcSessionCache && (now - _rpcSessionCache.ts) < GATEWAY_RPC_TTL_MS) {
+    return _rpcSessionCache.data
+  }
+  try {
+    const payload = await callOpenClawGateway<unknown>('sessions.list', {}, 8000)
+    const mapped = mapGatewayRpcSessions(payload, { now, activeWithinMs: GATEWAY_RPC_ACTIVE_WINDOW_MS })
+    _rpcSessionCache = { data: mapped, ts: now }
+    return mapped
+  } catch (err) {
+    logger.warn({ err }, 'Gateway sessions.list RPC failed; using local session stores only')
+    return []
+  }
+}
+
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
   try {
-    const gatewaySessions = getAllGatewaySessions()
+    // Local on-disk session stores (populated when OpenClaw runs on this host)
+    // plus live gateway sessions via RPC (populated for remote/pod gateways).
+    const rpcGatewaySessions = await getGatewayRpcSessions()
+    const gatewaySessions = [...getAllGatewaySessions(), ...rpcGatewaySessions]
     const mappedGatewaySessions = mapGatewaySessions(gatewaySessions)
 
     // Always include local sessions alongside gateway sessions
