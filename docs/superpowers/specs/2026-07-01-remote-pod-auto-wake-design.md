@@ -1,242 +1,266 @@
-# Remote Pod Auto-Wake — Design
+# Remote Pod Auto-Wake — Design (v2)
 
 **Date:** 2026-07-01
 **Status:** Approved (design) — pending implementation plan
-**Related:** yw0nam/mission-control#17 (broader remote-mode rewiring — out of scope here)
+**Related:** #17 (remote-mode rewiring), #18 (backup/durability ops),
+#19 (autonomous keep-alive — out of scope here)
+
+> v2 incorporates a design review: wake is hosted by a **dedicated minimal waker
+> service** (not the operator); the idle-stamp scope is narrowed to *interactive*
+> use (autonomous keep-alive → #19); plus security/cold-start/timeout/observability
+> fixes.
 
 ## Problem
 
-OpenClaw agent pods run in a Kubernetes cluster with **scale-to-zero**: the operator
-patches `spec.suspended=true` after 1h idle (judged solely by the
-`openclaw.rocks/last-active` annotation), which scales the StatefulSet to 0 replicas.
-The pod's gateway then goes down.
+OpenClaw agent pods run in Kubernetes with **scale-to-zero**: the operator patches
+`spec.suspended=true` after an idle window (`OPENCLAW_IDLE_SUSPEND_AFTER`, env-configured
+and **disabled if unset** — "1h" is only a doc example), judged solely by the
+`openclaw.rocks/last-active` annotation (`internal/controller/idlesuspend.go:41-60`).
+Suspending scales the StatefulSet to 0 and the pod's gateway goes down.
 
-Mission Control (MC) runs **outside the cluster, installed on each user's local
-machine** (docker). It connects to a pod's gateway via traefik (browser-direct
-WebSocket for live events + server-side RPC via `callOpenClawGateway` for chat).
+Mission Control (MC) runs **outside the cluster, installed on each user's local machine**
+(docker). It reaches a pod's gateway via traefik (browser-direct WebSocket for live
+events + server-side RPC `callOpenClawGateway` for chat).
 
-Two consequences today:
-1. When a pod is suspended, the user has **no way to wake it** from MC — chat RPC and
-   the browser WS both hit a down gateway (traefik 503). Auto-wake is a mandatory
-   requirement.
-2. The remote session list is fetched live via `sessions.list` (10s in-memory cache
-   only); when the pod is suspended it returns `[]`, so the user can't even **see**
-   their conversations to click into one (which would be the natural wake trigger).
+Problems:
+1. A suspended pod cannot be woken from MC — chat RPC and the browser WS both hit a down
+   gateway (traefik 503). **Auto-wake is mandatory.**
+2. The remote session list is fetched live via `sessions.list` (10s in-memory cache);
+   when suspended it returns `[]`, so the user can't even see conversations to click into
+   (the natural wake trigger).
+
+### Who writes `last-active` today (verified)
+
+**Nothing writes it continuously.** The operator only *reads* it; its comment attributes
+writes to a "Mission Control gateway broker" that belonged to an earlier *in-cluster*
+design and does not exist in this topology. The openclaw runtime tracks activity in
+memory (`lastActiveAt`, `openclaw/src/infra/agent-events.ts:436`) but never bridges it to
+the CR annotation; MC never touches k8s. So `last-active` is written once (provisioning)
+then goes stale.
+
+Consequence for scope: this spec's stamping (on wake / chat interaction) keeps
+**interactive** chat alive, but an **autonomous run with no user input** would suspend
+mid-run. Fixing that requires the runtime to self-stamp — split out to **#19**.
 
 ## Constraints & scope
 
-- **Topology (b):** MC is installed by end users on their own machines. Users must
-  **not** have direct access to k3s / the operator API. Therefore the wake authority
-  **cannot** live on the user's machine (distributing cluster credentials to every
-  laptop breaks tenant isolation). The wake authority must live **in the cluster**;
-  the local MC only makes an authenticated request to wake **its own** pod.
-- The user's local MC already holds its pod's **gateway token** (used to connect).
-  That token is the natural per-tenant credential for authenticating a wake request.
-- The gateway `wake` RPC method exists but is useless here: the gateway is **down**
-  when suspended, so only the k8s control plane (operator) can scale the pod back up.
-- **Wake trigger policy (A): explicit interaction only.** Waking happens when the user
-  actually engages an agent — opening a conversation (`chat.history`), sending a
-  message (`chat.send`), or clicking an explicit "wake/connect" button. Passive
-  activity — dashboard load, `sessions.list` polling, the ambient live-events WS — does
-  **not** wake, preserving the point of scale-to-zero (cost).
+- **Topology (b):** MC is installed by end users on their own machines. Users must NOT
+  have direct k3s / operator access. Wake authority must live in the cluster; the local
+  MC only makes an authenticated request to wake **its own** pod.
+- The local MC already holds its pod's **gateway token**; that token is the per-tenant
+  credential authenticating a wake request.
+- The gateway `wake` RPC is useless here: the gateway is down when suspended, so only the
+  k8s control plane can scale the pod back up.
+- **Wake trigger policy (A): explicit interaction only.** Wake happens when the user
+  engages an agent — opening a conversation (`chat.history`), sending a message
+  (`chat.send`), or clicking a wake button. Passive activity (dashboard load,
+  `sessions.list` polling, the ambient live-events WS) does NOT wake, preserving
+  scale-to-zero.
 
 ## Data ownership & placement (governing principle)
 
-The remote pod is the **single source of truth** for everything the agent runtime uses:
-sessions, chat history, memory, soul, skills, cron, agent config, and the secrets/.env
-the agent consumes. MC is a **client + display cache**; its only authoritative local
-data is dashboard-operational (user auth, gateway registry, settings, alerts, audit).
-Host-local tooling (the user's own Claude/Codex/etc. CLIs) is a separate concern,
+The remote pod is the **single source of truth** for all agent state (sessions, chat,
+memory, soul, skills, cron, agent config, secrets). MC is a **client + display cache**;
+its only authoritative local data is dashboard-operational (auth, gateway registry,
+settings, alerts, audit). Host-local tooling (the user's own CLIs) is a separate concern,
 hidden in remote mode.
 
-**Rule of thumb: reads may be cached (shown stale when the pod is suspended); writes
-require waking the pod.** MC never persists agent state as authoritative — writes go to
-the pod via gateway RPC; MC keeps a non-authoritative mirror for display, refreshed from
-the pod after a write (read-your-write).
-
-Locked placement decisions:
-- **Chat history** — pod-authoritative; MC's chat DB is demoted to a mirror/cache for
-  display when disconnected.
-- **Agent config / registry** — written to the pod (`config.*` / `agents.*`), mirrored
-  into MC for display.
-- **Memory** — pod-authoritative; the memory *chunk* graph (`/api/memory/graph`) is a
-  derived, pod-internal index with no gateway RPC → hidden in remote mode.
-
-Durability is **not** provided by the MC mirror — see Durability below. This maps to the
-standard CQRS read-model / materialized-view pattern (write model = pod = single source
-of truth; read model = MC cache with bounded staleness) plus offline-first *reads*. It
-governs both this spec and the broader remote-mode rewiring (#17).
+**Rule of thumb: reads may be cached (shown stale when suspended); writes require waking
+the pod.** MC never persists agent state as authoritative — writes go to the pod via RPC;
+MC keeps a non-authoritative mirror for display, refreshed from the pod after a write
+(read-your-write). Locked decisions: chat history = pod-authoritative (MC chat DB → mirror
+cache); agent config/registry = pod-write + MC mirror; memory chunk graph
+(`/api/memory/graph`) = derived, no RPC → hidden in remote mode. Durability is NOT the MC
+mirror's job (see Durability). Maps to CQRS read-model / materialized-view + offline-first
+*reads*; governs this spec and #17.
 
 ## Architecture
 
 ```
-User's machine                     Cluster (users have no direct k8s/operator access)
-┌──────────────┐                   ┌─────────────────────────────────────────────┐
-│ MC (docker)  │                   │  operator (always running)                    │
-│              │  POST /wake       │   POST /wake {slug, token}                     │
-│ server RPC ──┼──{slug,token}────▶│    ├─ find OpenClawInstance where Name==slug   │
-│ (chat.*)     │   (traefik, TLS)  │    ├─ read <slug>-gateway-token secret,        │
-│              │                   │    │   constant-time compare token             │
-│              │                   │    └─ if match: patch spec.suspended=false     │
-│              │                   │             + annotate last-active=now          │
-│ browser WS ──┼──(chat, events)──▶│   reconciler: statefulSetReplicas 0→N → pod up │
-│ (live events)│ ◀─ pod up → existing reconnect loop restores the WS               │
-└──────────────┘                   └─────────────────────────────────────────────┘
+User's machine                  Cluster (users have no direct k8s/operator access)
+┌──────────────┐                ┌──────────────────────────────────────────────┐
+│ MC (docker)  │                │  waker (dedicated Deployment, minimal RBAC)    │
+│              │ POST /wake     │   POST /wake {slug, token}   (traefik + TLS)   │
+│ server RPC ──┼─{slug,token}──▶│    ├─ find OpenClawInstance(s) name==slug      │
+│ (chat.*)     │                │    ├─ read <slug>-gateway-token secret,        │
+│              │                │    │   constant-time compare (dummy on miss)   │
+│              │                │    └─ if ok: patch spec.suspended=false         │
+│              │                │             + stamp last-active=now             │
+│ browser WS ──┼─(chat,events)─▶│  operator reconciler: replicas 0→1 → pod up    │
+│ (live events)│ ◀─ pod up → MC readiness-poll → existing reconnect restores WS  │
+└──────────────┘                └──────────────────────────────────────────────┘
+   RBAC: waker SA = get secrets + get/patch openclawinstances ONLY (no rbac/others).
+   The operator is untouched (no internet listener on the high-privilege component).
 ```
-
-Wake authority lives only in the operator. The local MC never talks to the k8s API;
-it POSTs one token-authenticated HTTP request to wake its own pod.
 
 ## Components
 
-### 1. Operator `/wake` HTTP endpoint (Go)
+### 1. Waker service (Go, new minimal Deployment)
 
-Add a small `http.Server` to the operator via `mgr.Add(<Runnable>)` in
-`openclaw-operator/cmd/main.go` (no new Deployment; the operator already runs
-always-on and has the RBAC). New flag `--wake-bind-address` (default `:8082`).
+A small standalone HTTP service in the cluster (its own Deployment + ServiceAccount).
+Chosen over hosting on the operator because: the operator's `mgr.Add` Runnable runs only
+on the leader (drops on restart/failover); the operator holds cluster-wide RBAC
+(instances, secrets, roles/rolebindings) and must not expose an internet listener; a
+handler panic would take down reconcilers. A dedicated service isolates blast radius,
+is leader-election-free, and is trivially HA.
 
-- **Request:** `POST /wake` with JSON `{ "slug": "alice", "token": "<gateway-token>" }`.
-- **Resolve:** list `OpenClawInstance` across watched namespaces, select the one with
-  `metadata.name == slug`. If none → `404`. (Slug is assumed unique per tenant; even if
-  two instances shared a name across namespaces, the token compare below is the real
-  authority and would only match the correct tenant's secret.)
-- **Authenticate:** read Secret `<slug>-gateway-token` (`GatewayTokenSecretName`,
-  key `token`, `internal/resources/common.go:365`) in that instance's namespace;
-  `subtle.ConstantTimeCompare` against the request token. Mismatch → `401`.
-- **Wake:** if `spec.Suspended` is true, patch it to `false`; always set annotation
-  `openclaw.rocks/last-active = <now unix seconds>` (`LastActiveAnnotation`,
-  `internal/controller/idlesuspend.go:36`) so the idle-suspend loop doesn't
-  immediately re-suspend. Use a patch (not full update) per repo reconcile rules.
-- **Response:** `200 { "status": "waking" | "running", "phase": "<pod phase>" }`.
-  Idempotent — repeated calls on a running pod are no-ops (only the annotation bumps).
-- **Exposure:** an always-on Service + traefik route to the operator on the wake port.
-- **RBAC:** existing operator permissions suffice (it already patches
-  `OpenClawInstance` and has `get` on secrets).
+- **RBAC (minimal):** `get` secrets + `get`/`patch` openclawinstances. Nothing else.
+- **Request:** `POST /wake` JSON `{ "slug": "alice", "token": "<gateway-token>" }`.
+  Strict JSON parse, request-body size cap, `recover()` around the handler,
+  `context.WithTimeout` on all k8s client calls.
+- **Resolve:** list `OpenClawInstance` across namespaces; **iterate all** with
+  `metadata.name == slug` (cross-namespace name collisions are disambiguated by the token
+  compare below).
+- **Authenticate:** read Secret `<slug>-gateway-token` (`GatewayTokenSecretName`, key
+  `token`, `internal/resources/common.go:365`); `subtle.ConstantTimeCompare`. On a miss
+  (unknown slug or bad token) run a **dummy constant-time compare** and return a
+  **uniform** response identical to the bad-token case (no 404-vs-401 enumeration oracle).
+- **Wake:** if `spec.Suspended`, patch it `false` (resume yields **1** replica, or `nil`
+  when HPA-managed — `internal/resources/statefulset.go:2784`); always set annotation
+  `openclaw.rocks/last-active=<now unix s>`. A stateless `Patch` is used (avoids read-modify
+  races); the operator's own idle path uses `r.Update` on the CR with optimistic locking,
+  so a wake racing an in-flight suspend self-heals via RV conflict + requeue.
+- **Response:** uniform `200 { "status": "ok" }` on success; uniform failure on
+  miss/bad-token. Idempotent (repeat calls only bump the annotation).
+- **Exposure (must be built):** Service + traefik route (kustomize **and** Helm) with
+  **required TLS**, DNS, and a **NetworkPolicy allow-rule** (the project ships deny-all
+  baselines). **Rate-limiting at traefik** (not in-process) to blunt request-flood DoS.
 
 ### 2. MC server-side wake helper + wake-on-demand wrapper (TypeScript)
 
-- **`wakeRemotePod(slug, token)`** (new, e.g. `src/lib/openclaw-wake.ts`): `POST`s to
-  the operator wake URL. Config:
-  - `OPENCLAW_OPERATOR_WAKE_URL` (new env) — the traefik-exposed operator wake endpoint.
-  - `slug` — derived from `OPENCLAW_GATEWAY_HOST` (first DNS label, e.g.
-    `alice.<ip>.nip.io` → `alice`); overridable via new `OPENCLAW_GATEWAY_SLUG`.
-  - `token` — `getDetectedGatewayToken()` (`src/lib/gateway-runtime.ts`).
-  - Per-pod **debounce**: skip the call if we woke this slug within the last N seconds
-    (default 30s).
-  - If `OPENCLAW_OPERATOR_WAKE_URL` is unset → no-op (local/self-hosted deploys).
-- **Wrap `chat.history` and `chat.send`** in `src/lib/openclaw-gateway.ts` (or at the
-  call sites): before the RPC, call `wakeRemotePod` (debounced); on a connection
-  failure, `wakeRemotePod` then retry the RPC once. **Do not** wrap `sessions.list`.
+- **`wakeRemotePod(slug, token)`** (new, e.g. `src/lib/openclaw-wake.ts`): `POST`s to the
+  waker URL with an **`AbortController` timeout** (mirror `gateways/health/route.ts:211-217`,
+  ~5s) so a down waker never hangs a chat request. Config:
+  - `OPENCLAW_WAKE_URL` (new env) — the traefik-exposed waker endpoint. Unset → no-op
+    (local/self-hosted deploys). **Server-only**; never a `NEXT_PUBLIC_*` variant.
+  - `slug` from `OPENCLAW_GATEWAY_HOST` first DNS label (override `OPENCLAW_GATEWAY_SLUG`).
+  - `token` from `getDetectedGatewayToken()` (server-side, sync).
+  - **Debounce on success only:** record a successful wake per slug for N s (default 30s);
+    a failed wake does not suppress retries.
+- **Wrap `chat.history` and `chat.send`** (in `openclaw-gateway.ts` or the call sites):
+  call `wakeRemotePod` (debounced); then **readiness-gate** the RPC — poll
+  `/api/gateways/health` until ready with a bounded deadline (~60-120s, backoff) rather
+  than a single retry, because a cold StatefulSet boot (schedule + image pull + PVC attach
+  + agent + gateway WS) routinely exceeds the RPC's 12-15s timeout. Do **not** wrap
+  `sessions.list`.
+- **Gateway scope:** server-side `callOpenClawGateway` targets the single global
+  `config.gatewayHost` + `getDetectedGatewayToken()`. This spec assumes the primary
+  gateway for the chat auto-wake path; per-gateway wake is covered by the manual button
+  (component 3). Full multi-gateway server-side routing is deferred to #17.
 
 ### 3. MC manual-wake route (TypeScript)
 
-- **`POST /api/gateways/wake { id }`** (new route under `src/app/api/gateways/`):
-  resolves the gateway row → host→slug + token, calls the shared `wakeRemotePod`,
-  returns `{ status, phase }`. Thin wrapper; shares the helper with component 2.
+`POST /api/gateways/wake { id }` — resolves the gateway row → host→slug + token, calls the
+shared `wakeRemotePod`, returns status. Thin wrapper sharing the helper with component 2.
 
 ### 4. UI — wake button + suspended status (TypeScript/React)
 
-- Add a **"Wake / Connect"** button per gateway in `multi-gateway-panel.tsx`
-  (the `/gateways` panel) and/or `gateway-control-panel.tsx`, and optionally on the
-  overview. Click → `POST /api/gateways/wake` → show "waking…" → poll existing
-  `/api/gateways/health` until ready → existing reconnect loop restores the WS.
-- Reframe suspended state: where a down pod currently shows "disconnected /
-  no active connection" (an error), show **"suspended — starts on interaction"** so
-  the ambient GW-retry spinner no longer reads as a failure.
+- "Wake / Connect" button per gateway in `multi-gateway-panel.tsx` (and/or
+  `gateway-control-panel.tsx`). Click → `POST /api/gateways/wake` → "waking…" → poll
+  readiness → existing reconnect loop restores the WS.
+- Reframe a down pod from "disconnected / no active connection" (error) to
+  **"suspended — starts on interaction."**
+- **Readiness-poll caveat (load-bearing, #17 dependency):** the health route probes the
+  stored host/port (default 18789) and probes *all* gateways per call
+  (`gateways/health/route.ts:129-156`). A traefik-fronted remote pod answers on 443, so
+  the `gateways` row must carry the correct remote host/port for readiness polling to work.
 
 ### 5. Session local cache (TypeScript)
 
-Persist the last successful `sessions.list` so suspended pods still show their
-conversations (which the user can click to wake — trigger A).
+Persist the last successful `sessions.list` so suspended pods still list their
+conversations (clickable → `chat.history` → wake).
 
-- **Storage:** reuse the existing `settings` KV table (`migrations.ts:241`,
-  `key/value TEXT`). Key `gateway_sessions_cache:<slug>`, value = JSON of the last
-  successful mapped `GatewaySession[]`, category `cache`. Per-gateway single blob,
-  overwrite-on-success — no new table, no per-row schema, no pruning.
-- **`getGatewayRpcSessions()`** (`src/app/api/sessions/route.ts`) changes:
-  - RPC success → return results **and** overwrite the KV blob.
-  - RPC failure (pod down) → read the KV blob; return those entries with
-    `active:false` and a `stale:true` flag.
-- **UI:** stale sessions get a "suspended" badge; clicking one opens `chat.history`
-  → wakes (trigger A). **Cold cache** (a pod MC has never talked to) → empty list →
-  the manual wake button (component 3) is the fallback. Cache + button cover each
-  other's gaps.
-- **Non-authoritative:** this cache is a display read-model, **not** a backup (see
-  Durability). After a write to a slug, refresh that slug's cache from the pod
-  (read-your-write).
+- **Storage:** reuse the `settings` KV table (`migrations.ts:238-252`). Key
+  `gateway_sessions_cache:<slug>`, value = JSON of last-good mapped `GatewaySession[]`,
+  category `cache`. Per-gateway blob, overwrite-on-success — no new table/pruning.
+- **`getGatewayRpcSessions()`** (`src/app/api/sessions/route.ts`): RPC success → return +
+  overwrite blob; RPC failure → read blob, return entries with `active:false` + `stale:true`.
+- **Type:** add a `stale?: boolean` field to `GatewaySession` (`src/lib/sessions.ts:5-20`)
+  (or attach at the route layer).
+- **Non-authoritative:** a display read-model, **not** a backup (see Durability). After a
+  write to a slug, refresh that slug's cache from the pod (read-your-write) **best-effort**:
+  if the pod is still cold, defer/retry the refresh; never block the user action on it.
+- **Interaction with existing fallback:** `chat.history` already silently falls back to a
+  disk transcript on RPC failure (`sessions/transcript/gateway/route.ts:44`); in a
+  remote-only deploy that disk is empty, so the RPC/cache path is authoritative.
+- **UI:** stale sessions get a "suspended" badge. **Cold cache** (never-contacted pod) →
+  empty list → the manual wake button (component 3) is the fallback.
 
 ## Data flow
 
-**Manual button:** UI → `POST /api/gateways/wake {id}` → MC resolves slug+token →
-`wakeRemotePod` → operator `/wake` → verify + patch + stamp → `{status,phase}` →
-UI polls health → WS reconnects.
-
-**Chat (open / send):** `chat.history`/`chat.send` server RPC → wrapper calls
-`wakeRemotePod` (debounced) → RPC proceeds (retry once on cold-start failure).
-
-**Passive (no wake):** `sessions.list` and the ambient live-events WS never call
-`wakeRemotePod`; the session list is served live if the pod is up, else from the KV
-cache marked stale.
+- **Manual button:** UI → `POST /api/gateways/wake {id}` → MC resolves slug+token →
+  `wakeRemotePod` (timeout) → waker `/wake` → verify + patch + stamp → uniform status →
+  MC readiness-polls → WS reconnects.
+- **Chat (open/send):** `chat.history`/`chat.send` → wrapper `wakeRemotePod` (debounced) →
+  readiness-gate → RPC.
+- **Passive (no wake):** `sessions.list` + ambient WS never wake; session list served live
+  if up, else from KV cache marked stale.
 
 ## Authentication & security
 
-- The **gateway token is the only credential**, held solely by the MC server. `/wake`
-  is called server-side only — the operator URL/token are never exposed to the browser.
-- The operator narrows to a single CR by `slug`, then compares **only that CR's**
-  secret — no cluster-wide secret scan, no ability to wake another tenant's pod.
-- traefik TLS recommended on the wake route. The user's machine holds **zero** k8s
-  credentials, satisfying the "users cannot access k3s/operator" constraint.
+- **Correction:** the gateway token is **already returned to the browser** for the
+  browser-direct WS (`gateways/connect/route.ts:180-185` → `websocket.ts:282`). So "can
+  also wake" adds **no** privilege over what a token-holder already has. Wake security
+  therefore reduces to **token secrecy + endpoint reachability + TLS**, not "server-only
+  calls." (The narrower true claim: the *waker URL* is server-only — never expose a
+  `NEXT_PUBLIC_OPENCLAW_WAKE_URL`.)
+- **TLS is required** (not "recommended"): token-in-POST-body is safe only over enforced
+  TLS. Consider an extra edge control (mTLS or a traefik-enforced front-door header).
+- **Blast radius:** the dedicated waker holds only `get secrets` + `get/patch instances`,
+  so an internet-facing listener there is far safer than on the operator.
+- **Enumeration/DoS:** uniform response for unknown-slug vs bad-token + dummy constant-time
+  compare on miss; rate-limit at traefik. `ConstantTimeCompare` alone is insufficient while
+  the slug lookup precedes it — hence the uniform/dummy handling.
 
 ## Error handling & idle-stamp
 
-- **Wake failure / timeout:** button shows "wake failed — retry"; the chat path
-  propagates the original RPC error (idempotent, so retry is safe).
-- **Cold start:** `/wake` returns immediately (pod boot is async). The chat RPC retries
-  briefly until the pod is ready; the button UX polls `/api/gateways/health`.
-- **Token mismatch:** operator returns `401`; MC fails quietly (logs only).
-- **Idle-stamp gap:** the operator stamps `last-active=now` on every `/wake`, and every
-  `chat.send`-driven wake refreshes it, so active use won't be idle-suspended
-  mid-session. No separate heartbeat endpoint is needed.
+- **Wake failure/timeout:** `wakeRemotePod` aborts on timeout; button shows "wake failed —
+  retry"; the chat path surfaces the error (idempotent → retry safe).
+- **Cold start:** wake returns immediately (async boot); RPC is readiness-gated with a
+  bounded deadline (see component 2), not a single retry.
+- **Auth failure:** uniform failure response; MC fails quietly (logs only).
+- **Idle-stamp (interactive only):** wake and each `chat.send` stamp `last-active=now`, so
+  interactive use stays alive as long as gaps < idle window. **Autonomous runs are NOT
+  covered here → #19** (runtime self-stamp).
 
 ## Durability (operational — not built here)
 
-The session cache is a display convenience, **not** a backup. Durability of
-pod-authoritative data against volume loss is the operator's responsibility via its
-existing PVC→S3 backup/restore: `BackupSpec.Schedule` → rclone CronJob to S3 with
-`RetentionDays`; `RestoreFrom` → restore before StatefulSet creation (`openclaw-operator`
-`api/v1alpha1/openclawinstance_types.go:613-653`, `internal/controller/{backup,restore}.go`).
+The session cache is a display convenience, **not** a backup. Durability against volume
+loss is the operator's existing PVC→S3 backup/restore (`BackupSpec.Schedule` → rclone
+CronJob; `RestoreFrom` → restore before StatefulSet creation). Operational follow-up in
+**#18**: enable a backup `Schedule` + `RetentionDays` per tenant and run periodic canary
+test-restores ("the question is not whether backups exist but when one was last
+successfully restored"; StatefulSet/operator-managed restores have known failure modes).
 
-Operational follow-up (tracked outside this spec):
-- Ensure the S3 backup credentials Secret exists (operator silently skips backup if not).
-- Set a backup `Schedule` + `RetentionDays` on every tenant `OpenClawInstance` (incl. `alice`).
-- Run periodic **canary test-restores** into a parallel namespace — "the question is not
-  whether backups exist but when one was last successfully restored." StatefulSet /
-  operator-managed workloads have known restore failure modes, so restores must be
-  exercised, not assumed.
+## Observability
+
+- **Waker:** a wake counter + latency histogram + outcome labels (ok / bad-token /
+  not-found / patch-error). Expose via Prometheus (operator infra already uses
+  Prometheus/OTLP).
+- **MC:** structured logs on every `wakeRemotePod` (slug, outcome, latency, debounced?)
+  to triage wake storms / failures.
 
 ## Testing (TDD)
 
-- **Operator `/wake`** (envtest / e2e): valid token → `suspended=false` + annotation;
-  wrong token → `401`, CR untouched; unknown slug → `404`; already-running → idempotent
-  no-op. e2e on kind verifies replicas 0→N.
-- **MC `wakeRemotePod` + wrapper** (vitest): payload shape, debounce, wake-then-retry
-  on failure — extracted as pure functions (mirrors the existing
-  `mapGatewayRpcSessions` test pattern). Assert `sessions.list` does **not** call
-  `wakeRemotePod`.
-- **Session cache** (vitest): success overwrites KV blob; failure returns cached
-  entries flagged `stale`/`active:false`.
-- **UI button:** click → route call → status transitions.
+- **Waker `/wake`** (Go unit + envtest / e2e): valid token → `suspended=false` +
+  annotation; bad token and unknown slug → **identical** uniform failure (assert no oracle);
+  already-running → idempotent; handler recovers from panic; body-size cap enforced. e2e on
+  kind verifies replicas 0→1.
+- **MC `wakeRemotePod` + wrapper** (vitest): payload, timeout/abort, debounce-on-success,
+  readiness-gate loop, error propagation — pure functions (mirrors `mapGatewayRpcSessions`
+  test pattern). Assert `sessions.list` never calls `wakeRemotePod`.
+- **Session cache** (vitest): success overwrites blob; failure returns cached entries
+  flagged `stale`/`active:false`.
+- **UI button:** click → route → status transitions.
 
-## Deliberately out of scope (YAGNI)
+## Deliberately out of scope (YAGNI / split)
 
-- **Per-tenant rate-limit / flap-backoff** — the patch is idempotent and the idle
-  window is 1h, so wake→immediate-suspend cannot happen. Add a per-slug token bucket in
-  the operator only if abuse is observed.
-- **Transparent activator (KEDA/Knative)** — rejected on ROI: heaviest infra
-  (WS interceptor + Gateway API rewiring + collision with the operator's own suspend
-  logic) for a marginal gain over a tiny MC change.
-- **Separate in-cluster waker service** — dominated by hosting the endpoint on the
-  existing operator (no new deployment).
-- **Separate heartbeat endpoint** — `last-active` is stamped on wake / `chat.send`.
-- **Broader remote-mode rewiring** (cron, files, integrations, skills, memory, etc.) —
-  tracked in yw0nam/mission-control#17.
+- **Autonomous keep-alive** (runtime self-stamps `last-active`) → **#19**.
+- **Broader remote-mode rewiring** (cron, files, integrations, skills, memory, etc.) → **#17**.
+- **Backup enablement + test-restore** → **#18**.
+- **Full multi-gateway server-side wake routing** → #17 (manual per-row button covers it
+  for now).
+- **Per-tenant wake rate-limit / flap-backoff in-app** — the patch is idempotent; do
+  request-flood rate-limiting at traefik instead. Add per-slug buckets only if abuse is seen.
+- **Transparent activator (KEDA/Knative)** — rejected on ROI (heaviest infra; WS
+  interceptor + Gateway API rewiring + collision with operator suspend).
