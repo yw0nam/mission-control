@@ -17,8 +17,6 @@ export interface GatewaySession {
   outputTokens: number
   contextTokens: number
   active: boolean
-  /** True when served from the KV cache because the live RPC failed (suspended pod). */
-  stale?: boolean
 }
 
 function getGatewaySessionStoreFiles(): string[] {
@@ -110,46 +108,6 @@ export function getAllGatewaySessions(activeWithinMs = 60 * 60 * 1000, force = f
 
   // Compute `active` at read time so it's always fresh regardless of cache age
   return raw.map(s => ({ ...s, active: (now - s.updatedAt) < activeWithinMs }))
-}
-
-/**
- * Map an OpenClaw gateway `sessions.list` RPC payload (frame.payload) into
- * GatewaySession records. Pure: callers pass `now`/`activeWithinMs` so it stays
- * testable. Used for remote pods where the agent's session store lives in the
- * pod (not on the local disk that getAllGatewaySessions reads).
- */
-export function mapGatewayRpcSessions(
-  payload: unknown,
-  opts: { now: number; activeWithinMs: number },
-): GatewaySession[] {
-  const sessions = (payload as { sessions?: unknown } | null)?.sessions
-  if (!Array.isArray(sessions)) return []
-
-  const out: GatewaySession[] = []
-  for (const raw of sessions) {
-    const s = raw as Record<string, any>
-    const key = typeof s?.key === 'string' ? s.key : ''
-    if (!key) continue
-    // Session keys look like "agent:<agent>:<chat>" — derive the agent segment.
-    const parts = key.split(':')
-    const agent = parts.length >= 2 && parts[1] ? parts[1] : (typeof s.agent === 'string' ? s.agent : 'main')
-    const updatedAt = Number(s.updatedAt || 0)
-    out.push({
-      key,
-      agent,
-      sessionId: typeof s.sessionId === 'string' ? s.sessionId : '',
-      updatedAt,
-      chatType: s.chatType || s.kind || 'unknown',
-      channel: s.deliveryContext?.channel || s.lastChannel || s.channel || '',
-      model: typeof s.model === 'object' && s.model?.primary ? String(s.model.primary) : String(s.model || ''),
-      totalTokens: Number(s.totalTokens || 0),
-      inputTokens: Number(s.inputTokens || 0),
-      outputTokens: Number(s.outputTokens || 0),
-      contextTokens: Number(s.contextTokens || 0),
-      active: updatedAt > 0 && (opts.now - updatedAt) < opts.activeWithinMs,
-    })
-  }
-  return out
 }
 
 export function countStaleGatewaySessions(retentionDays: number): number {

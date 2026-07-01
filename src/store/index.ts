@@ -247,7 +247,6 @@ export interface Conversation {
     workingDir?: string | null
     lastUserPrompt?: string | null
     active?: boolean
-    stale?: boolean
     age?: string
   }
   participants: string[]
