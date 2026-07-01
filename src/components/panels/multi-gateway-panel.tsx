@@ -188,6 +188,20 @@ export function MultiGatewayPanel() {
     }
   }
 
+  const wakeGateway = async (gw: Gateway) => {
+    try {
+      const res = await apiFetch<{ ok?: boolean }>('/api/gateways/wake', {
+        method: 'POST',
+        body: JSON.stringify({ id: gw.id }),
+      })
+      // Explicitly reconnect on success — the passive reconnect loop caps at 10
+      // attempts, too few for a cold StatefulSet boot (src/lib/websocket.ts).
+      if (res?.ok) connectTo(gw)
+    } catch {
+      // ignore — apiFetch throws on a failed/no-op wake; status stays as-is
+    }
+  }
+
   const probeAll = async () => {
     try {
       const data = await apiFetch<{ results?: GatewayHealthProbe[] }>("/api/gateways/health", { method: "POST" })
@@ -289,6 +303,7 @@ export function MultiGatewayPanel() {
               onSetPrimary={() => setPrimary(gw)}
               onDelete={() => deleteGateway(gw.id)}
               onConnect={() => connectTo(gw)}
+              onWake={() => wakeGateway(gw)}
               onProbe={() => probeGateway(gw)}
               onUpdateToken={(token) => updateToken(gw, token)}
             />
@@ -444,7 +459,7 @@ export function MultiGatewayPanel() {
   )
 }
 
-function GatewayCard({ gateway, health, historyEntries = [], isProbing, isCurrentlyConnected, onSetPrimary, onDelete, onConnect, onProbe, onUpdateToken }: {
+function GatewayCard({ gateway, health, historyEntries = [], isProbing, isCurrentlyConnected, onSetPrimary, onDelete, onConnect, onWake, onProbe, onUpdateToken }: {
   gateway: Gateway
   health?: GatewayHealthProbe
   historyEntries?: GatewayHealthLogEntry[]
@@ -453,6 +468,7 @@ function GatewayCard({ gateway, health, historyEntries = [], isProbing, isCurren
   onSetPrimary: () => void
   onDelete: () => void
   onConnect: () => void
+  onWake: () => void
   onProbe: () => void
   onUpdateToken: (token: string) => void
 }) {
@@ -596,6 +612,16 @@ function GatewayCard({ gateway, health, historyEntries = [], isProbing, isCurren
               title={t('connectToGateway')}
             >
               {t('connect')}
+            </Button>
+          )}
+          {!isCurrentlyConnected && (
+            <Button
+              onClick={onWake}
+              size="xs"
+              className="text-2xs bg-blue-500/20 text-blue-400 hover:bg-blue-500/30"
+              title={t('wakeGatewayTitle')}
+            >
+              {t('wake')}
             </Button>
           )}
           {!gateway.is_primary && (

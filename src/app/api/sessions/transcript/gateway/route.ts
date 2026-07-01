@@ -6,6 +6,7 @@ import { config } from '@/lib/config'
 import { logger } from '@/lib/logger'
 import { parseGatewayHistoryTranscript, parseJsonlTranscript } from '@/lib/transcript-parser'
 import { callOpenClawGateway } from '@/lib/openclaw-gateway'
+import { wakeRemotePod, isGatewayUnreachableError, waitForGatewayReady } from '@/lib/openclaw-wake'
 
 /**
  * GET /api/sessions/transcript/gateway?key=<session-key>&limit=50
@@ -33,17 +34,37 @@ export async function GET(request: NextRequest) {
     // Try the live RPC first: remote pods keep transcripts inside the pod, so
     // the disk fallback below is empty there. This must run before the
     // stateDir gate, which only guards the on-disk fallback.
-    try {
+    const fetchLiveTranscript = async () => {
       const history = await callOpenClawGateway<{ messages?: unknown[] }>(
         'chat.history',
         { sessionKey, limit },
         15000,
       )
-      const liveMessages = parseGatewayHistoryTranscript(Array.isArray(history?.messages) ? history.messages : [], limit)
+      return parseGatewayHistoryTranscript(Array.isArray(history?.messages) ? history.messages : [], limit)
+    }
+
+    try {
+      const liveMessages = await fetchLiveTranscript()
       if (liveMessages.length > 0) {
         return NextResponse.json({ messages: liveMessages, source: 'gateway-rpc' })
       }
     } catch (rpcErr) {
+      // Suspended remote pod: the gateway WS is down. Opening a conversation is
+      // an explicit interaction (wake trigger A), so wake, wait for readiness,
+      // and retry chat.history once before falling back to the disk transcript.
+      if (isGatewayUnreachableError(rpcErr)) {
+        await wakeRemotePod()
+        if (await waitForGatewayReady()) {
+          try {
+            const retried = await fetchLiveTranscript()
+            if (retried.length > 0) {
+              return NextResponse.json({ messages: retried, source: 'gateway-rpc' })
+            }
+          } catch (retryErr) {
+            logger.warn({ err: retryErr, sessionKey }, 'Gateway chat.history retry after wake failed')
+          }
+        }
+      }
       logger.warn({ err: rpcErr, sessionKey }, 'Gateway chat.history failed, falling back to disk transcript')
     }
 

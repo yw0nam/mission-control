@@ -7,6 +7,7 @@ import { requireRole } from '@/lib/auth'
 import { logger } from '@/lib/logger'
 import { scanForInjection, sanitizeForPrompt } from '@/lib/injection-guard'
 import { callOpenClawGateway } from '@/lib/openclaw-gateway'
+import { wakeRemotePod, isGatewayUnreachableError, waitForGatewayReady } from '@/lib/openclaw-wake'
 import { resolveCoordinatorDeliveryTarget } from '@/lib/coordinator-routing'
 
 type ForwardInfo = {
@@ -498,17 +499,26 @@ export async function POST(request: NextRequest) {
             const idempotencyKey = `mc-${messageId}-${Date.now()}`
 
             if (sessionKey) {
-              const acceptedPayload = await callOpenClawGateway<any>(
-                'chat.send',
-                {
-                  sessionKey,
-                  message: content,
-                  idempotencyKey,
-                  deliver: false,
-                  attachments: toGatewayAttachments(body.attachments),
-                },
-                12000,
-              )
+              const chatSendParams = {
+                sessionKey,
+                message: content,
+                idempotencyKey,
+                deliver: false,
+                attachments: toGatewayAttachments(body.attachments),
+              }
+              let acceptedPayload: any
+              try {
+                acceptedPayload = await callOpenClawGateway<any>('chat.send', chatSendParams, 12000)
+              } catch (sendErr) {
+                // Suspended remote pod: the gateway WS is down. Sending a message
+                // is an explicit interaction (wake trigger A), so wake, wait for
+                // readiness, and retry chat.send once. If wake/readiness/retry
+                // fails, rethrow to the existing outer catch (forwardInfo bookkeeping).
+                if (!isGatewayUnreachableError(sendErr)) throw sendErr
+                await wakeRemotePod()
+                if (!(await waitForGatewayReady())) throw sendErr
+                acceptedPayload = await callOpenClawGateway<any>('chat.send', chatSendParams, 12000)
+              }
               const status = String(acceptedPayload?.status || '').toLowerCase()
               forwardInfo.delivered = status === 'started' || status === 'ok' || status === 'in_flight'
               forwardInfo.session = sessionKey
