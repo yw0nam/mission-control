@@ -19,7 +19,6 @@ import { logger } from './logger'
 import { config } from './config'
 import { getDetectedGatewayToken } from './gateway-runtime'
 import { resolveTenantGateway } from './tenant-gateway'
-import { buildConnectFrame } from './openclaw-gateway'
 import { runSelfServiceLifecycle, markTenantActive } from './super-admin'
 import { readInstancePhase, k8sNamespace, stampLastActive } from './super-admin-k8s'
 
@@ -42,63 +41,7 @@ function reportActivity(slug: string): void {
 interface ProxyContext {
   upstreamUrl: string
   pfProc: ChildProcess | null
-  token: string // per-tenant (or host) gateway token — answers the connect.challenge server-side, NEVER sent to the browser
   slug?: string // tenant slug, present for owner (non-admin) sessions — drives activity reporting
-}
-
-/** What to do with one upstream (pod->browser) frame during/after the handshake. */
-interface UpstreamAction {
-  forwardToBrowser: boolean
-  sendUpstream?: ReturnType<typeof buildConnectFrame> // connect reply to send back upstream
-  flush?: boolean // handshake just completed — flush any queued browser frames
-}
-
-/** What to do with one browser (browser->pod) frame. */
-interface BrowserAction {
-  drop?: boolean // tokenless connect from the browser — never forward upstream
-  sendUpstream?: boolean // forward this frame upstream now
-  queue?: boolean // buffer until the handshake completes
-}
-
-/**
- * Server-side connect handshake for the /ws/gateway broker. The pod gateway sends
- * a `connect.challenge` event right after the upstream opens; we must reply with a
- * `connect` request carrying the per-tenant token (URL query token does NOT
- * authenticate the handshake). Both the challenge and the connect res(ok:true) are
- * swallowed — every other frame pipes through unchanged. Pure/stateful so it can be
- * unit-tested without real sockets.
- */
-export function createGatewayBroker(token: string) {
-  const connectId = `mc-broker-connect-${Date.now()}-${Math.random().toString(36).slice(2)}`
-  let complete = false
-
-  const parse = (raw: string | Buffer): any => {
-    try { return JSON.parse(raw.toString()) } catch { return null }
-  }
-
-  return {
-    get connectId() { return connectId },
-    get complete() { return complete },
-
-    onUpstreamFrame(raw: string | Buffer): UpstreamAction {
-      if (complete) return { forwardToBrowser: true }
-      const frame = parse(raw)
-      if (frame?.type === 'event' && frame?.event === 'connect.challenge') {
-        return { forwardToBrowser: false, sendUpstream: buildConnectFrame(token, connectId) }
-      }
-      if (frame?.type === 'res' && frame?.id === connectId) {
-        complete = true
-        return { forwardToBrowser: false, flush: true }
-      }
-      return { forwardToBrowser: true }
-    },
-
-    onBrowserFrame(raw: string | Buffer): BrowserAction {
-      const frame = parse(raw)
-      if (frame?.type === 'req' && frame?.method === 'connect') return { drop: true }
-      return complete ? { sendUpstream: true } : { queue: true }
-    },
-  }
 }
 
 let wss: WebSocketServer | null = null
@@ -157,22 +100,19 @@ function initServer(): WebSocketServer {
 
     const upstream = new WebSocket(ctx.upstreamUrl)
     const queue: Array<{ data: any; binary: boolean }> = []
-    const broker = createGatewayBroker(ctx.token)
+    let upstreamOpen = false
 
     const cleanup = () => {
       if (ctx.pfProc) { try { ctx.pfProc.kill() } catch { /* ignore */ } ; ctx.pfProc = null }
     }
 
-    const flushQueue = () => {
+    upstream.on('open', () => {
+      upstreamOpen = true
       for (const m of queue) { try { upstream.send(m.data, { binary: m.binary }) } catch {} }
       queue.length = 0
-    }
-
+    })
     upstream.on('message', (data: Buffer, isBinary: boolean) => {
-      const action = broker.onUpstreamFrame(data)
-      if (action.sendUpstream) { try { upstream.send(JSON.stringify(action.sendUpstream)) } catch {} }
-      if (action.flush) flushQueue()
-      if (action.forwardToBrowser && browserWs.readyState === WebSocket.OPEN) browserWs.send(data, { binary: isBinary })
+      if (browserWs.readyState === WebSocket.OPEN) browserWs.send(data, { binary: isBinary })
     })
     upstream.on('close', () => { try { browserWs.close() } catch {} ; cleanup() })
     upstream.on('error', (err) => { log.warn({ err: err?.message }, 'upstream gateway error'); try { browserWs.close() } catch {} ; cleanup() })
@@ -182,10 +122,8 @@ function initServer(): WebSocketServer {
       // to the cluster (throttled) so the operator's idle-suspend stays off while the
       // owner is actively working.
       if (ctx.slug) reportActivity(ctx.slug)
-      const action = broker.onBrowserFrame(data)
-      if (action.drop) return
-      if (action.sendUpstream) { try { upstream.send(data, { binary: isBinary }) } catch {} }
-      else if (action.queue) queue.push({ data, binary: isBinary })
+      if (upstreamOpen) { try { upstream.send(data, { binary: isBinary }) } catch {} }
+      else queue.push({ data, binary: isBinary })
     })
     browserWs.on('close', () => { try { upstream.close() } catch {} ; cleanup() })
     browserWs.on('error', () => { try { upstream.close() } catch {} ; cleanup() })
@@ -209,7 +147,6 @@ export async function handleGatewayUpgrade(req: IncomingMessage, socket: any, he
   let upstreamUrl: string
   let pfProc: ChildProcess | null = null
   let slug: string | undefined
-  let token: string
 
   try {
     const res = await resolveTenantGateway({ id: user.id, role: user.role })
@@ -220,7 +157,7 @@ export async function handleGatewayUpgrade(req: IncomingMessage, socket: any, he
     }
     if (res.kind === 'admin') {
       // Admins use the global/host gateway directly (host-reachable, no port-forward).
-      token = getDetectedGatewayToken()
+      const token = getDetectedGatewayToken()
       upstreamUrl = `ws://${config.gatewayHost}:${config.gatewayPort}/?token=${encodeURIComponent(token)}`
     } else if (res.kind === 'unavailable') {
       writeWsHttpError(socket, 503, 'Instance is not ready yet')
@@ -237,7 +174,6 @@ export async function handleGatewayUpgrade(req: IncomingMessage, socket: any, he
       }
       const pf = await startPortForward(res.tenant.slug, res.port)
       pfProc = pf.proc
-      token = res.token
       upstreamUrl = `ws://127.0.0.1:${pf.localPort}/?token=${encodeURIComponent(res.token)}`
       markTenantActive(res.tenant.id)
       slug = res.tenant.slug
@@ -251,7 +187,7 @@ export async function handleGatewayUpgrade(req: IncomingMessage, socket: any, he
   }
 
   if (!wss) initServer()
-  ;(req as any).__gwctx = { upstreamUrl, pfProc, token: token!, slug } as ProxyContext
+  ;(req as any).__gwctx = { upstreamUrl, pfProc, slug } as ProxyContext
   wss!.handleUpgrade(req, socket, head, (ws) => {
     wss!.emit('connection', ws, req)
   })

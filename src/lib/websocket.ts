@@ -52,78 +52,6 @@ interface GatewayMessage {
   timestamp?: number
 }
 
-const DEFAULT_CALL_TIMEOUT_MS = 15_000
-
-// Whether to skip the client `connect` handshake. The same-origin /ws/gateway
-// broker performs the openclaw handshake server-side with a per-tenant token the
-// browser never sees, so the browser must NOT send its own connect frame there.
-export function shouldSkipClientHandshake(url: string): boolean {
-  try {
-    const base = typeof window !== 'undefined' ? window.location.href : undefined
-    return new URL(url, base).pathname === '/ws/gateway'
-  } catch {
-    return false
-  }
-}
-
-interface PendingCall {
-  resolve: (value: any) => void
-  reject: (reason: any) => void
-  timer: ReturnType<typeof setTimeout>
-}
-
-// Request/response correlation for gateway RPC. Mirrors the ping/pong id logic
-// but resolves a Promise per request id. Pure (no DOM deps) so it is unit-tested
-// directly without a real WebSocket.
-export class GatewayCallRegistry {
-  private pending = new Map<string, PendingCall>()
-
-  constructor(
-    private readonly send: (frame: any) => boolean,
-    private readonly nextId: () => string,
-    private readonly defaultTimeoutMs = DEFAULT_CALL_TIMEOUT_MS,
-  ) {}
-
-  call(method: string, params?: any, timeoutMs = this.defaultTimeoutMs): Promise<any> {
-    const id = this.nextId()
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id)
-        reject(new Error(`Gateway call timed out: ${method}`))
-      }, timeoutMs)
-      this.pending.set(id, { resolve, reject, timer })
-      if (!this.send({ type: 'req', method, id, params })) {
-        this.pending.delete(id)
-        clearTimeout(timer)
-        reject(new Error(`Gateway not connected: ${method}`))
-      }
-    })
-  }
-
-  // Returns true if the frame matched (and settled) a pending call.
-  handleFrame(frame: { type?: string; id?: string; ok?: boolean; result?: any; payload?: any; error?: GatewayFrame['error'] }): boolean {
-    if (frame.type !== 'res' || !frame.id) return false
-    const pending = this.pending.get(frame.id)
-    if (!pending) return false
-    this.pending.delete(frame.id)
-    clearTimeout(pending.timer)
-    // The openclaw gateway returns RPC results under `payload`; older/mock
-    // gateways use `result`. Prefer `result` for back-compat, fall back to
-    // `payload` so callers get the real data either way.
-    if (frame.ok) pending.resolve(frame.result ?? frame.payload)
-    else pending.reject(new Error(frame.error?.message || 'Gateway call failed'))
-    return true
-  }
-
-  rejectAll(reason: any): void {
-    for (const pending of this.pending.values()) {
-      clearTimeout(pending.timer)
-      pending.reject(reason)
-    }
-    this.pending.clear()
-  }
-}
-
 // Shared websocket singleton state across hook mounts.
 const wsRef: { current: WebSocket | null } = { current: null }
 const reconnectTimeoutRef: { current: NodeJS.Timeout | undefined } = { current: undefined }
@@ -145,24 +73,6 @@ const lastSeqRef: { current: number | null } = { current: null }
 const tokenOnlyFallbackRef: { current: boolean } = { current: false }
 const tokenOnlyFallbackTriedRef: { current: boolean } = { current: false }
 const wsPathFallbackTriedRef: { current: Set<string> } = { current: new Set() }
-const skipClientHandshakeRef: { current: boolean } = { current: false }
-
-// Module-level RPC registry. Sends only when OPEN + handshake complete (same
-// gate as sendMessage); ids share the requestIdRef counter so they never collide
-// with connect/ping frames.
-const callRegistry = new GatewayCallRegistry(
-  (frame) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN && handshakeCompleteRef.current) {
-      wsRef.current.send(JSON.stringify(frame))
-      return true
-    }
-    return false
-  },
-  () => {
-    requestIdRef.current += 1
-    return `mc-${requestIdRef.current}`
-  },
-)
 
 export function useWebSocket() {
   const maxReconnectAttempts = 10
@@ -466,12 +376,6 @@ export function useWebSocket() {
     if (frame.type === 'event' && frame.event === 'connect.challenge') {
       log.info('Received connect challenge, sending handshake')
       sendConnectHandshake(ws, frame.payload?.nonce)
-      return
-    }
-
-    // Route gateway RPC responses (call helper) to their pending promise before
-    // the generic handshake/ping/error handling so call errors reject the caller.
-    if (frame.type === 'res' && callRegistry.handleFrame(frame)) {
       return
     }
 
@@ -789,7 +693,6 @@ export function useWebSocket() {
       wsPathFallbackTriedRef.current.clear()
     }
     reconnectUrl.current = normalizedUrl
-    skipClientHandshakeRef.current = shouldSkipClientHandshake(url)
     handshakeCompleteRef.current = false
     manualDisconnectRef.current = false
     nonRetryableErrorRef.current = null
@@ -806,19 +709,6 @@ export function useWebSocket() {
           url: normalizedUrl,
           reconnectAttempts: 0
         })
-        if (skipClientHandshakeRef.current) {
-          // Same-origin broker handshakes for us; mark complete so sendMessage/call flush.
-          log.info('Broker path (/ws/gateway): skipping client connect handshake')
-          handshakeCompleteRef.current = true
-          reconnectAttemptsRef.current = 0
-          setConnection({
-            isConnected: true,
-            lastConnected: new Date(),
-            reconnectAttempts: 0
-          })
-          startHeartbeat()
-          return
-        }
         // Wait for connect.challenge from server
         log.debug('Waiting for connect challenge')
       }
@@ -844,7 +734,6 @@ export function useWebSocket() {
         setConnection({ isConnected: false })
         handshakeCompleteRef.current = false
         stopHeartbeat()
-        callRegistry.rejectAll(new Error('Gateway disconnected'))
 
         // Skip auto-reconnect if this was a manual disconnect
         if (manualDisconnectRef.current) return
@@ -938,7 +827,7 @@ export function useWebSocket() {
       }
       setConnection({ isConnected: false })
     }
-  }, [setConnection, handleGatewayFrame, addLog, startHeartbeat, stopHeartbeat, normalizeWebSocketUrl, shouldSuppressWebSocketError])
+  }, [setConnection, handleGatewayFrame, addLog, stopHeartbeat, normalizeWebSocketUrl, shouldSuppressWebSocketError])
 
   // Keep ref in sync so onclose always calls the latest version of connect
   useEffect(() => {
@@ -979,11 +868,6 @@ export function useWebSocket() {
     return false
   }, [])
 
-  const call = useCallback(
-    (method: string, params?: any, timeoutMs?: number) => callRegistry.call(method, params, timeoutMs),
-    [],
-  )
-
   const reconnect = useCallback(() => {
     disconnect()
     if (reconnectUrl.current) {
@@ -997,8 +881,7 @@ export function useWebSocket() {
     connect,
     disconnect,
     reconnect,
-    sendMessage,
-    call
+    sendMessage
   }
 }
 

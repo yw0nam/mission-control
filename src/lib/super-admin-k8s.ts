@@ -72,23 +72,9 @@ spec:
     raw:
       agents:
         defaults:
-          model: { primary: "vllm/GPT-OSS-120B" }
+          model: { primary: "openai/GPT-OSS-120B" }
           sandbox: { mode: "off" }
       session: { scope: "per-sender" }
-      models:
-        providers:
-          vllm:
-            baseUrl: "__OPENAI_BASE_URL__"
-            apiKey: "dummy"
-            api: "openai-completions"
-            models:
-              - id: "GPT-OSS-120B"
-                name: "GPT-OSS-120B"
-                reasoning: true
-                input: ["text"]
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-                contextWindow: 262144
-                maxTokens: 8192
   storage:
     persistence: { enabled: true, size: 2Gi }
   security:

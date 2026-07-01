@@ -4,8 +4,6 @@ import { useState, useEffect, useCallback } from 'react'
 import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { useMissionControl } from '@/store'
-import { useWebSocket } from '@/lib/websocket'
-import { useSmartPoll } from '@/lib/use-smart-poll'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -222,7 +220,7 @@ function ProbeResult({ probe }: { probe: ChannelStatus['probe'] }) {
   )
 }
 
-function CardShell({ platform, label, children, status, accounts, onProbe, probing, readOnly }: {
+function CardShell({ platform, label, children, status, accounts, onProbe, probing }: {
   platform: string
   label?: string
   children: React.ReactNode
@@ -230,7 +228,6 @@ function CardShell({ platform, label, children, status, accounts, onProbe, probi
   accounts?: ChannelAccount[]
   onProbe: () => void
   probing: boolean
-  readOnly?: boolean
 }) {
   const t = useTranslations('channels')
   const icon = PLATFORM_ICONS[platform] ?? '\u{1F4E1}'
@@ -252,23 +249,20 @@ function CardShell({ platform, label, children, status, accounts, onProbe, probi
         </div>
       </div>
       {children}
-      {/* ponytail: read-only pod-scoped view hides the probe action (host /api/channels?action=probe) */}
-      {!readOnly && (
-        <Button
-          onClick={onProbe}
-          disabled={probing}
-          variant="outline"
-          size="xs"
-          className="w-full mt-3"
-        >
-          {probing ? (
-            <>
-              <span className="w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
-              {t('probing')}
-            </>
-          ) : t('probe')}
-        </Button>
-      )}
+      <Button
+        onClick={onProbe}
+        disabled={probing}
+        variant="outline"
+        size="xs"
+        className="w-full mt-3"
+      >
+        {probing ? (
+          <>
+            <span className="w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
+            {t('probing')}
+          </>
+        ) : t('probe')}
+      </Button>
     </div>
   )
 }
@@ -277,7 +271,7 @@ function CardShell({ platform, label, children, status, accounts, onProbe, probi
 // Per-Platform Cards
 // ---------------------------------------------------------------------------
 
-function WhatsAppCard({ status, accounts, onProbe, probing, onAction, actionBusy, readOnly }: PlatformCardProps) {
+function WhatsAppCard({ status, accounts, onProbe, probing, onAction, actionBusy }: PlatformCardProps) {
   const t = useTranslations('channels')
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null)
   const [message, setMessage] = useState<string | null>(null)
@@ -309,7 +303,7 @@ function WhatsAppCard({ status, accounts, onProbe, probing, onAction, actionBusy
   }
 
   return (
-    <CardShell platform="whatsapp" status={status} accounts={accounts} onProbe={onProbe} probing={probing} readOnly={readOnly}>
+    <CardShell platform="whatsapp" status={status} accounts={accounts} onProbe={onProbe} probing={probing}>
       <div className="space-y-0.5">
         <StatusRow label="Configured" value={yesNo(status?.configured)} />
         <StatusRow label="Linked" value={yesNo(status?.linked)} />
@@ -335,34 +329,31 @@ function WhatsAppCard({ status, accounts, onProbe, probing, onAction, actionBusy
         </div>
       )}
 
-      {/* ponytail: read-only pod-scoped view hides link/wait/logout (host /api/channels POST) */}
-      {!readOnly && (
-        <div className="flex flex-wrap gap-1.5 mt-3">
-          <Button onClick={() => handleLink(false)} disabled={actionBusy} variant="outline" size="xs">
-            {t('showQr')}
-          </Button>
-          <Button onClick={() => handleLink(true)} disabled={actionBusy} variant="outline" size="xs">
-            {t('relink')}
-          </Button>
-          <Button onClick={handleWait} disabled={actionBusy} variant="outline" size="xs">
-            {t('waitForScan')}
-          </Button>
-          <Button onClick={handleLogout} disabled={actionBusy} variant="destructive" size="xs">
-            {t('logout')}
-          </Button>
-        </div>
-      )}
+      <div className="flex flex-wrap gap-1.5 mt-3">
+        <Button onClick={() => handleLink(false)} disabled={actionBusy} variant="outline" size="xs">
+          {t('showQr')}
+        </Button>
+        <Button onClick={() => handleLink(true)} disabled={actionBusy} variant="outline" size="xs">
+          {t('relink')}
+        </Button>
+        <Button onClick={handleWait} disabled={actionBusy} variant="outline" size="xs">
+          {t('waitForScan')}
+        </Button>
+        <Button onClick={handleLogout} disabled={actionBusy} variant="destructive" size="xs">
+          {t('logout')}
+        </Button>
+      </div>
 
       {accounts.length > 0 && <AccountList accounts={accounts} />}
     </CardShell>
   )
 }
 
-function TelegramCard({ status, accounts, onProbe, probing, readOnly }: PlatformCardProps) {
+function TelegramCard({ status, accounts, onProbe, probing }: PlatformCardProps) {
   const botUsername = status?.probe?.bot?.username
 
   return (
-    <CardShell platform="telegram" status={status} accounts={accounts} onProbe={onProbe} probing={probing} readOnly={readOnly}>
+    <CardShell platform="telegram" status={status} accounts={accounts} onProbe={onProbe} probing={probing}>
       <div className="space-y-0.5">
         <StatusRow label="Configured" value={yesNo(status?.configured)} />
         <StatusRow label="Running" value={yesNo(status?.running)} />
@@ -377,11 +368,11 @@ function TelegramCard({ status, accounts, onProbe, probing, readOnly }: Platform
   )
 }
 
-function DiscordCard({ status, accounts, onProbe, probing, readOnly }: PlatformCardProps) {
+function DiscordCard({ status, accounts, onProbe, probing }: PlatformCardProps) {
   const botUsername = status?.probe?.bot?.username
 
   return (
-    <CardShell platform="discord" status={status} accounts={accounts} onProbe={onProbe} probing={probing} readOnly={readOnly}>
+    <CardShell platform="discord" status={status} accounts={accounts} onProbe={onProbe} probing={probing}>
       <div className="space-y-0.5">
         <StatusRow label="Configured" value={yesNo(status?.configured)} />
         <StatusRow label="Running" value={yesNo(status?.running)} />
@@ -395,12 +386,12 @@ function DiscordCard({ status, accounts, onProbe, probing, readOnly }: PlatformC
   )
 }
 
-function SlackCard({ status, accounts, onProbe, probing, readOnly }: PlatformCardProps) {
+function SlackCard({ status, accounts, onProbe, probing }: PlatformCardProps) {
   const teamName = status?.probe?.team?.name
   const botName = status?.probe?.bot?.username
 
   return (
-    <CardShell platform="slack" status={status} accounts={accounts} onProbe={onProbe} probing={probing} readOnly={readOnly}>
+    <CardShell platform="slack" status={status} accounts={accounts} onProbe={onProbe} probing={probing}>
       <div className="space-y-0.5">
         <StatusRow label="Configured" value={yesNo(status?.configured)} />
         <StatusRow label="Running" value={yesNo(status?.running)} />
@@ -415,9 +406,9 @@ function SlackCard({ status, accounts, onProbe, probing, readOnly }: PlatformCar
   )
 }
 
-function SignalCard({ status, accounts, onProbe, probing, readOnly }: PlatformCardProps) {
+function SignalCard({ status, accounts, onProbe, probing }: PlatformCardProps) {
   return (
-    <CardShell platform="signal" status={status} accounts={accounts} onProbe={onProbe} probing={probing} readOnly={readOnly}>
+    <CardShell platform="signal" status={status} accounts={accounts} onProbe={onProbe} probing={probing}>
       <div className="space-y-0.5">
         <StatusRow label="Configured" value={yesNo(status?.configured)} />
         <StatusRow label="Running" value={yesNo(status?.running)} />
@@ -431,7 +422,7 @@ function SignalCard({ status, accounts, onProbe, probing, readOnly }: PlatformCa
   )
 }
 
-function NostrCard({ status, accounts, onProbe, probing, onAction, actionBusy, readOnly }: PlatformCardProps) {
+function NostrCard({ status, accounts, onProbe, probing, onAction, actionBusy }: PlatformCardProps) {
   const t = useTranslations('channels')
   const primaryAccount = accounts[0]
   const profile: NostrProfile | null = primaryAccount?.profile ?? status?.profile ?? null
@@ -487,7 +478,7 @@ function NostrCard({ status, accounts, onProbe, probing, onAction, actionBusy, r
   }
 
   return (
-    <CardShell platform="nostr" status={status} accounts={accounts} onProbe={onProbe} probing={probing} readOnly={readOnly}>
+    <CardShell platform="nostr" status={status} accounts={accounts} onProbe={onProbe} probing={probing}>
       <div className="space-y-0.5">
         <StatusRow label="Configured" value={yesNo(status?.configured)} />
         <StatusRow label="Running" value={yesNo(status?.running)} />
@@ -501,8 +492,7 @@ function NostrCard({ status, accounts, onProbe, probing, onAction, actionBusy, r
         <div className="mt-3 p-2.5 bg-muted/30 rounded text-xs">
           <div className="flex justify-between items-center mb-1.5">
             <span className="font-medium text-foreground">{t('profile')}</span>
-            {/* ponytail: read-only pod-scoped view hides profile edit (host /api/channels POST nostr-profile-save/import) */}
-            {!readOnly && status?.configured && (
+            {status?.configured && (
               <Button onClick={openProfileForm} variant="ghost" size="xs" className="h-5 text-[10px] px-1.5">
                 {t('edit')}
               </Button>
@@ -559,9 +549,9 @@ function NostrCard({ status, accounts, onProbe, probing, onAction, actionBusy, r
   )
 }
 
-function GenericChannelCard({ platform, label, status, accounts, onProbe, probing, readOnly }: PlatformCardProps & { label?: string }) {
+function GenericChannelCard({ platform, label, status, accounts, onProbe, probing }: PlatformCardProps & { label?: string }) {
   return (
-    <CardShell platform={platform} label={label} status={status} accounts={accounts} onProbe={onProbe} probing={probing} readOnly={readOnly}>
+    <CardShell platform={platform} label={label} status={status} accounts={accounts} onProbe={onProbe} probing={probing}>
       <div className="space-y-0.5">
         <StatusRow label="Configured" value={yesNo(status?.configured)} />
         <StatusRow label="Running" value={yesNo(status?.running)} />
@@ -644,41 +634,22 @@ interface PlatformCardProps {
   probing: boolean
   onAction: (action: string, params: Record<string, unknown>) => Promise<unknown>
   actionBusy: boolean
-  readOnly?: boolean
 }
 
 // ---------------------------------------------------------------------------
 // Main Component
 // ---------------------------------------------------------------------------
 
-export function ChannelsPanel({ podScoped }: { podScoped?: boolean } = {}) {
+export function ChannelsPanel() {
   const t = useTranslations('channels')
   const { connection } = useMissionControl()
-  const { call, isConnected } = useWebSocket()
   const [snapshot, setSnapshot] = useState<ChannelsSnapshot | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [probing, setProbing] = useState<string | null>(null)
   const [actionBusy, setActionBusy] = useState(false)
 
-  // Pod-scoped (read-only viewer) loads the snapshot from the pod gateway over
-  // the WebSocket. `channels.status` returns the same shape the panel consumes
-  // minus `connected`, so we splice in the live WS connection state. Host
-  // `/api/channels` 403s pod-owner viewers, so it is bypassed entirely here.
-  const fetchChannelsGateway = useCallback(async () => {
-    if (!isConnected) return
-    try {
-      const result = await call('channels.status')
-      setSnapshot({ ...result, connected: isConnected } as ChannelsSnapshot)
-      setError(null)
-    } catch {
-      setError('Failed to load channels')
-    } finally {
-      setLoading(false)
-    }
-  }, [call, isConnected])
-
-  const fetchChannelsApi = useCallback(async () => {
+  const fetchChannels = useCallback(async () => {
     try {
       const res = await fetch('/api/channels')
       if (res.status === 401 || res.status === 403) {
@@ -699,22 +670,11 @@ export function ChannelsPanel({ podScoped }: { podScoped?: boolean } = {}) {
     }
   }, [])
 
-  const fetchChannels = podScoped ? fetchChannelsGateway : fetchChannelsApi
-
   useEffect(() => {
-    if (podScoped) return // gateway path bootstraps + polls via useSmartPoll below
-    fetchChannelsApi()
-    const interval = setInterval(fetchChannelsApi, 30000)
+    fetchChannels()
+    const interval = setInterval(fetchChannels, 30000)
     return () => clearInterval(interval)
-  }, [podScoped, fetchChannelsApi])
-
-  // Pod-scoped polling: useSmartPoll fires an initial fetch on mount and then
-  // refreshes every 45s, pausing while the tab is hidden or the WS is down.
-  useSmartPoll(fetchChannelsGateway, 45000, {
-    pauseWhenDisconnected: true,
-    backoff: true,
-    enabled: Boolean(podScoped),
-  })
+  }, [fetchChannels])
 
   const handleProbe = async (channelId: string) => {
     setProbing(channelId)
@@ -805,7 +765,6 @@ export function ChannelsPanel({ podScoped }: { podScoped?: boolean } = {}) {
       probing: isPlatformProbing,
       onAction: handleAction,
       actionBusy,
-      readOnly: podScoped,
     }
 
     switch (key) {

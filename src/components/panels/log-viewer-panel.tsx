@@ -6,8 +6,6 @@ import { Button } from '@/components/ui/button'
 import { Loader } from '@/components/ui/loader'
 import { useMissionControl } from '@/store'
 import { useSmartPoll } from '@/lib/use-smart-poll'
-import { useWebSocket } from '@/lib/websocket'
-import { gatewayLogsToEntries } from '@/components/chat/gateway-adapters'
 import { createClientLogger } from '@/lib/client-logger'
 
 const log = createClientLogger('LogViewer')
@@ -31,10 +29,9 @@ function downloadFile(content: string, filename: string, mime: string) {
   URL.revokeObjectURL(url)
 }
 
-export function LogViewerPanel({ podScoped }: { podScoped?: boolean } = {}) {
+export function LogViewerPanel() {
   const t = useTranslations('logViewer')
   const { logs, logFilters, setLogFilters, clearLogs, addLog } = useMissionControl()
-  const { call, isConnected } = useWebSocket()
   const [isAutoScroll, setIsAutoScroll] = useState(true)
   const [availableSources, setAvailableSources] = useState<string[]>([])
   const [isLoading, setIsLoading] = useState(false)
@@ -136,45 +133,22 @@ export function LogViewerPanel({ podScoped }: { podScoped?: boolean } = {}) {
     }
   }, [])
 
-  // ponytail: pod-scoped path reads the viewer's own pod over the gateway WS
-  // (host /api/* 403s for viewers). Store has no bulk setter, so we mirror the
-  // host path: clearLogs() then addLog() per entry (deduped by id in the store).
-  const loadPodLogs = useCallback(async () => {
-    if (!isConnected) return
-    try {
-      const result = await call('logs.tail', { limit: 200 })
-      const entries = gatewayLogsToEntries(result)
-      // entries are oldest→newest; addLog prepends, so reverse to keep newest first.
-      clearLogs()
-      entries.reverse().forEach((entry) => addLog(entry))
-    } catch (error) {
-      log.error('Failed to load pod logs:', error)
-    }
-  }, [isConnected, call, clearLogs, addLog])
-
-  useSmartPoll(loadPodLogs, 10000, {
-    enabled: podScoped,
-    pauseWhenDisconnected: true,
-    backoff: true,
-  })
-
-  // Load initial logs and sources (host-only path; pod path bootstraps via useSmartPoll)
+  // Load initial logs and sources
   useEffect(() => {
-    if (podScoped) return
     log.debug('Initial load started')
     loadLogs()
     loadSources()
     loadLogFilePath()
-  }, [podScoped, loadLogs, loadSources, loadLogFilePath])
+  }, [loadLogs, loadSources, loadLogFilePath])
 
-  // Smart polling for log tailing (30s, visibility-aware, logs mostly come via WS)
+  // Smart polling for log tailing (10s, visibility-aware, logs mostly come via WS)
   const pollLogs = useCallback(() => {
     if (autoScrollRef.current && !isLoading) {
       loadLogs(true) // tail mode
     }
   }, [isLoading, loadLogs])
 
-  useSmartPoll(pollLogs, 30000, { pauseWhenConnected: true, enabled: !podScoped })
+  useSmartPoll(pollLogs, 30000, { pauseWhenConnected: true })
 
   // Auto-scroll to bottom when new logs arrive
   useEffect(() => {
@@ -185,8 +159,8 @@ export function LogViewerPanel({ podScoped }: { podScoped?: boolean } = {}) {
 
   const handleFilterChange = (newFilters: Partial<LogFilters>) => {
     setLogFilters(newFilters)
-    // Pod mode filters purely client-side; host mode reloads with the new filters.
-    if (!podScoped) setTimeout(() => loadLogs(), 100)
+    // Reload logs with new filters
+    setTimeout(() => loadLogs(), 100)
   }
 
   const handleScrollToBottom = () => {
@@ -246,7 +220,7 @@ export function LogViewerPanel({ podScoped }: { podScoped?: boolean } = {}) {
         <h1 className="text-3xl font-bold text-foreground">{t('title')}</h1>
         <p className="text-muted-foreground mt-2">
           {t('description')}
-          {!podScoped && logFilePath && (
+          {logFilePath && (
             <span className="ml-3 font-mono text-xs text-muted-foreground/70">{logFilePath}</span>
           )}
         </p>
@@ -336,26 +310,20 @@ export function LogViewerPanel({ podScoped }: { podScoped?: boolean } = {}) {
 
           {/* Export & Clear */}
           <div className="flex items-end space-x-2">
-            {/* ponytail: export pulls full host log files — host-only, hidden for pod viewers. */}
-            {!podScoped && (
-              <>
-                <Button
-                  onClick={handleExportText}
-                  disabled={filteredLogs.length === 0}
-                  className="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40"
-                >
-                  {t('exportLog')}
-                </Button>
-                <Button
-                  onClick={handleExportJson}
-                  disabled={filteredLogs.length === 0}
-                  className="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40"
-                >
-                  {t('exportJson')}
-                </Button>
-              </>
-            )}
-            {/* clearLogs only clears the in-memory store view — safe in pod mode. */}
+            <Button
+              onClick={handleExportText}
+              disabled={filteredLogs.length === 0}
+              className="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40"
+            >
+              {t('exportLog')}
+            </Button>
+            <Button
+              onClick={handleExportJson}
+              disabled={filteredLogs.length === 0}
+              className="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40"
+            >
+              {t('exportJson')}
+            </Button>
             <Button
               onClick={clearLogs}
               variant="destructive"
