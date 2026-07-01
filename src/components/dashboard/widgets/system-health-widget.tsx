@@ -89,7 +89,7 @@ export function SystemHealthWidget({ data }: { data: DashboardData }) {
             </>
           ) : (
             <>
-              <HealthRow label="Gateway" value={connection.isConnected ? 'Connected' : 'Disconnected'} status={gatewayHealthStatus} />
+              <HealthRow label="Gateway" value={connection.isConnected ? 'Connected' : 'Suspended'} status={gatewayHealthStatus} />
               <HealthRow label="MC Core" value={mcHealth.value} status={mcHealth.status} />
             </>
           )}

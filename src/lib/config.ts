@@ -95,6 +95,13 @@ export const config = {
   clawdbotBin: process.env.CLAWDBOT_BIN || resolveDefaultCliBin('clawdbot'),
   gatewayHost: process.env.OPENCLAW_GATEWAY_HOST || '127.0.0.1',
   gatewayPort: clampInt(Number(process.env.OPENCLAW_GATEWAY_PORT || '18789'), 1, 65535, 18789),
+  // Per-tenant slug used to key the remote pod (session cache, wake). Explicit
+  // override, else the first DNS label of the gateway host; '' when neither set.
+  gatewaySlug:
+    process.env.OPENCLAW_GATEWAY_SLUG ||
+    (process.env.OPENCLAW_GATEWAY_HOST ? process.env.OPENCLAW_GATEWAY_HOST.split('.')[0] : ''),
+  // Server-only waker endpoint used to resume a suspended pod. Unset -> no-op.
+  wakeUrl: process.env.OPENCLAW_WAKE_URL ?? '',
   logsDir:
     process.env.OPENCLAW_LOG_DIR ||
     (openclawStateDir ? path.join(openclawStateDir, 'logs') : ''),
